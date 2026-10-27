@@ -1,0 +1,18 @@
+[package]
+name = "githelper"
+version = "0.1.0"
+edition = "2024"
+description = "Translate plain language into Git commands using Apple's on-device model"
+license = "MIT"
+build = "build.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "2"
+
+[profile.release]
+lto = true
+strip = true
