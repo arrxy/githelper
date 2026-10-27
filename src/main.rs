@@ -291,4 +291,54 @@ Review these commands before running them in /repo.
         assert_eq!(json["changes_repository"], false);
         assert!(!json.to_string().contains("reset"));
     }
+
+    #[test]
+    fn missing_commit_recovery_renders_clarification_without_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .arg(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let proposal: plan::Proposal = serde_json::from_value(serde_json::json!({
+            "outcome": "ready",
+            "summary": "Recover the lost commit",
+            "clarification": "",
+            "steps": [{
+                "action": "createBranchAt",
+                "value": "login",
+                "paths": [],
+                "sha": "abc1234"
+            }]
+        }))
+        .unwrap();
+        let plan = proposal.validate(directory.path()).unwrap();
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text,
+            "Clarification needed: Commit abc1234 does not resolve to an existing commit. Which commit SHA should be recovered? Use `git reflog -n 20` to find it.\n"
+        );
+        assert!(!text.contains("reset"));
+        assert!(!text.contains("Review these commands"));
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["outcome"], "needsClarification");
+        assert_eq!(json["commands"], serde_json::json!([]));
+        assert_eq!(json["changes_repository"], false);
+        assert!(json.get("destructive").is_none());
+        assert!(!json.to_string().contains("reset"));
+        let listed = std::process::Command::new("git")
+            .args(["for-each-ref", "refs/heads"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert!(listed.stdout.is_empty());
+    }
 }
