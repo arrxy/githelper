@@ -43,15 +43,83 @@ githelper --draft-commit
 githelper --draft-commit --json
 ```
 
-If compilation cannot find Foundation Models, check `xcodebuild -version` and
-`xcrun --show-sdk-version`. Select your Xcode 26+ installation as the active
-developer directory before rebuilding.
+`githelper --doctor` prints one pass or fail line per prerequisite. See
+[Setup and troubleshooting](#setup-and-troubleshooting) when a check fails or
+the build cannot find the Swift toolchain.
 
 The build script compiles the Swift bridge and embeds it inside the Rust
 executable. At inference time it extracts the helper into a private temporary
 directory, exchanges JSON over stdin/stdout, and removes it afterward. You can
 move the built executable without separately installing the bridge. Build
 natively for each Mac architecture; cross-compilation is not supported.
+
+## Setup and troubleshooting
+
+`githelper --doctor` checks macOS, Xcode and Swift, Apple Intelligence, Git,
+and whether `--repo` (default `.`) is inside a Git work tree. Each check prints
+`[pass]` or `[fail]` plus a fix hint. The command exits 0 only when every
+required check passes. The repository check is optional, so doctor can succeed
+before you `cd` into a project; pass `--repo` when you want that path checked.
+`githelper --doctor --json` prints the same result. `available` and `detail`
+describe the on-device model (existing callers can keep reading those fields).
+`ok` is true when every required check passed.
+
+```text
+$ githelper --doctor
+[pass] macOS 26 or newer
+       macOS 26.0
+[pass] Xcode 26 and Swift
+       Xcode 26.0, macOS SDK 26.0
+[pass] Apple Intelligence
+       Apple's on-device model is ready. Inference stays on this Mac.
+[pass] Git
+       git version 2.50.1
+[pass] Git repository (optional)
+       /Users/me/code/your-repository
+All required checks passed.
+```
+
+On a machine that is not ready, the same command names the gap and exits
+non-zero. From this repository on Linux, where Git is installed and the
+working directory is a repository, doctor looks like this:
+
+```text
+$ githelper --doctor
+[fail] macOS 26 or newer
+       This system is linux, not macOS.
+       Fix: Upgrade to macOS 26 or newer on an Apple Intelligence-capable Mac.
+[fail] Xcode 26 and Swift
+       The Swift toolchain is missing (xcrun: No such file or directory (os error 2)).
+       Fix: Install Xcode 26 or newer, then select it with `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer` and rebuild.
+[fail] Apple Intelligence
+       Requires macOS 26 or newer on an Apple Intelligence-capable Mac with Apple Intelligence enabled and its on-device model downloaded.
+       Fix: Enable Apple Intelligence in System Settings and wait for the on-device model to finish downloading.
+[pass] Git
+       git version 2.43.0
+[pass] Git repository (optional)
+       /workspace
+3 required checks failed.
+```
+
+Outside a work tree the repository line fails instead, with a hint to `cd`
+into a repository or pass `--repo`. That line is optional, so a ready Mac
+still exits 0. Stderr on failure is a one-line summary, for example
+`githelper: setup checks failed: macOS 26 or newer; Xcode 26 and Swift; Apple Intelligence`.
+
+A failed build prints one error and exits. It does not dump a panic backtrace.
+The message names what is missing and how to fix it:
+
+- Upgrade to macOS 26 or newer on an Apple Intelligence-capable Mac.
+- Install Xcode 26 or newer, including the macOS 26 SDK.
+- Select that Xcode: `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
+- Accept the license if prompted: `sudo xcodebuild -license`
+- Enable Apple Intelligence and wait until the on-device model has downloaded.
+- Install Git. Run githelper inside a repository, or pass `--repo`.
+
+Confirm the selected tools with `xcodebuild -version` and
+`xcrun --sdk macosx --show-sdk-version` before rebuilding. If a later run reports that the
+model is unavailable or the Apple bridge failed, run `githelper --doctor`.
+There is no cloud fallback.
 
 ## Supported requests
 
@@ -142,12 +210,15 @@ cargo clippy --all-targets --locked -- -D warnings
 ```
 
 The Rust core and CLI checks run on Linux without the Apple framework.
-Translation is available only on a supported Mac. These features are implemented;
-actual model inference and output quality remain unverified in this environment.
-macOS CI compiles the real Swift bridge; an Apple Intelligence-capable Mac is required to test actual
-inference, availability, refusal behavior, and translation quality. After
-`githelper --doctor` succeeds, try the requests above and check that ambiguous
-requests such as `githelper "commit my changes"` ask for clarification.
+Doctor pass/fail decisions are pure functions of probed facts, so Linux CI
+covers the check wording without Xcode or Apple Intelligence. Translation is
+available only on a supported Mac. These features are implemented; actual model
+inference and output quality remain unverified in this environment. macOS CI
+compiles the real Swift bridge; an Apple Intelligence-capable Mac is required
+to test actual inference, availability, refusal behavior, and translation
+quality. After `githelper --doctor` succeeds, try the requests above and check
+that ambiguous requests such as `githelper "commit my changes"` ask for
+clarification.
 
 Run the [on-device evaluation harness](evals/README.md) on a supported Mac to
 check real model responses against reproducible Git scenarios. Its separate
