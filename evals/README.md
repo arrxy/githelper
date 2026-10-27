@@ -79,6 +79,7 @@ python3 -m unittest discover -s evals -p 'test_*.py'
 These standard-library tests use real temporary Git fixtures and mock only the
 githelper process boundary. They test cleanup, error reporting, mutation checks,
 Git configuration and hook isolation, interruption cleanup, and POSIX timeout
-cleanup. CI runs these tests on Linux and macOS without calling Apple inference.
+cleanup. Run these tests locally; the evaluation harness and its preflight
+checks are excluded from CI.
 Their passing results are not model evaluation results. Normal
 `cargo test --locked` also does not run model evaluations.
