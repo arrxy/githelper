@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Real, on-device githelper evaluations. Never executes a generated plan."""
+"""Real, on-device githelper evaluations. Never executes a generated plan.
+
+``--offline`` runs only scenarios that fail before inference and skips the
+Apple model preflight. Those scenarios are not model-quality results.
+"""
 from __future__ import annotations
 
 import argparse
@@ -163,6 +167,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--binary", type=Path, default=Path("target/debug/githelper"))
     parser.add_argument("--case", action="append", default=[], help="exact case name; repeatable")
     parser.add_argument("--list", action="store_true", help="list cases without running the model")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="run only scenarios that do not call the model, and skip Apple preflight",
+    )
     parser.add_argument("--timeout", type=float, default=120)
     parser.add_argument("--artifacts", type=Path)
     parser.add_argument("--keep-failures", action="store_true")
@@ -173,15 +182,27 @@ def main(argv: list[str] | None = None) -> int:
     if set(args.case) - names:
         parser.error("unknown cases: " + ", ".join(sorted(set(args.case) - names)))
     cases = [case for case in CASES if not args.case or case.name in args.case]
+    if args.offline:
+        selected_model = [case.name for case in cases if case.requires_model]
+        if args.case and selected_model:
+            parser.error(
+                "model-dependent scenarios stay on a supported Mac; "
+                "--offline cannot run: " + ", ".join(selected_model)
+            )
+        cases = [case for case in cases if not case.requires_model]
+        if not cases:
+            parser.error("no offline scenarios selected")
     if args.list:
         for case in cases:
-            print(f"{case.name}: {case.description}")
+            suffix = "" if case.requires_model else " [offline]"
+            print(f"{case.name}: {case.description}{suffix}")
         return 0
     binary = args.binary.resolve()
     artifacts = (args.artifacts or Path("eval-results") / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-" + uuid.uuid4().hex[:8])).resolve()
     artifacts.mkdir(parents=True, exist_ok=False)
     summary = {"binary": str(binary), "artifacts": str(artifacts), "cases": [], "passed": False,
-               "platform": platform.platform(), "python_version": platform.python_version(),
+               "offline": args.offline, "platform": platform.platform(),
+               "python_version": platform.python_version(),
                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     exit_code = 1
     def interrupted(_signal, _frame):
@@ -196,23 +217,26 @@ def main(argv: list[str] | None = None) -> int:
                 binary_size += len(chunk)
         summary["binary_sha256"] = binary_digest.hexdigest()
         summary["binary_size_bytes"] = binary_size
-        with tempfile.TemporaryDirectory(prefix="githelper-preflight-") as temporary:
-            root = Path(temporary)
-            preflight = run_process([str(binary), "--doctor", "--json"], root,
-                                    isolated_environment(root / "config-home"), args.timeout,
-                                    artifacts / "doctor.stdout.txt", artifacts / "doctor.stderr.txt")
-            summary["preflight"] = preflight
-            try:
-                status = json.loads(read_output(artifacts / "doctor.stdout.txt"))
-            except (ValueError, UnicodeError):
-                status = {}
-            if not isinstance(status, dict):
-                status = {}
-            summary["doctor_status"] = {key: status.get(key) for key in ("available", "detail")}
-            if preflight["timed_out"] or preflight["returncode"] != 0:
-                raise RuntimeError("Apple model preflight failed; see doctor stdout/stderr artifacts")
-            if status.get("available") is not True:
-                raise RuntimeError("Apple model preflight did not report available=true")
+        if args.offline:
+            summary["preflight"] = {"skipped": True}
+        else:
+            with tempfile.TemporaryDirectory(prefix="githelper-preflight-") as temporary:
+                root = Path(temporary)
+                preflight = run_process([str(binary), "--doctor", "--json"], root,
+                                        isolated_environment(root / "config-home"), args.timeout,
+                                        artifacts / "doctor.stdout.txt", artifacts / "doctor.stderr.txt")
+                summary["preflight"] = preflight
+                try:
+                    status = json.loads(read_output(artifacts / "doctor.stdout.txt"))
+                except (ValueError, UnicodeError):
+                    status = {}
+                if not isinstance(status, dict):
+                    status = {}
+                summary["doctor_status"] = {key: status.get(key) for key in ("available", "detail")}
+                if preflight["timed_out"] or preflight["returncode"] != 0:
+                    raise RuntimeError("Apple model preflight failed; see doctor stdout/stderr artifacts")
+                if status.get("available") is not True:
+                    raise RuntimeError("Apple model preflight did not report available=true")
         for index, case in enumerate(cases, 1):
             result = run_case(case, binary, artifacts / f"{index:02d}-{case.name}", args.timeout, args.keep_failures)
             summary["cases"].append(result)
