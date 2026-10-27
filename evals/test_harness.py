@@ -246,6 +246,50 @@ class HarnessTests(unittest.TestCase):
         time.sleep(0.7)
         self.assertFalse(marker.exists(), "descendant survived timeout")
 
+    def test_offline_list_hides_model_scenarios(self):
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            code = harness.main(["--list", "--offline"])
+        self.assertEqual(code, 0)
+        listed = stdout.getvalue()
+        self.assertIn("draft-empty", listed)
+        self.assertIn("[offline]", listed)
+        self.assertNotIn("status-mixed", listed)
+        self.assertNotIn("draft-ratio", listed)
+
+    def test_offline_rejects_explicit_model_cases(self):
+        with contextlib.redirect_stderr(io.StringIO()) as error:
+            with self.assertRaises(SystemExit) as raised:
+                harness.main(["--offline", "--case", "status-mixed"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("status-mixed", error.getvalue())
+
+    def test_offline_skips_model_preflight(self):
+        self.binary.write_bytes(b"dummy binary for metadata hashing only")
+        artifacts = self.root / "offline-artifacts"
+        seen = []
+
+        def fake_run_case(case, binary, artifact_dir, timeout, keep):
+            seen.append(case.name)
+            self.assertEqual(binary, self.binary.resolve())
+            self.assertFalse(case.requires_model)
+            return {"name": case.name, "passed": True, "reasons": []}
+
+        with patch.object(harness, "run_case", side_effect=fake_run_case), \
+                patch.object(harness, "run_process") as run_process, \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = harness.main(["--binary", str(self.binary), "--artifacts", str(artifacts), "--offline"])
+        self.assertEqual(code, 0)
+        run_process.assert_not_called()
+        self.assertEqual(
+            seen,
+            [case.name for case in scenarios.CASES if not case.requires_model],
+        )
+        summary = json.loads((artifacts / "summary.json").read_text())
+        self.assertTrue(summary["passed"])
+        self.assertTrue(summary["offline"])
+        self.assertEqual(summary["preflight"], {"skipped": True})
+        self.assertNotIn("doctor_status", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

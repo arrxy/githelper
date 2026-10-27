@@ -16,7 +16,7 @@ use std::{
 #[command(
     version,
     about = "Plain language → Git commands, using Apple's on-device model.",
-    after_help = "Examples:\n  githelper \"show my staged changes\"\n  githelper --repo ~/code/app \"create a branch called fix/login\"\n  githelper --json \"stage README.md and commit with message update docs\"\n  githelper --doctor\n  githelper --interactive \"commit my changes\"\n  githelper --draft-commit --json\n  githelper \"I lost a commit\"\n\nCommands are printed for review. Nothing is executed."
+    after_help = "Examples:\n  githelper \"show my staged changes\"\n  githelper --repo ~/code/app \"create a branch called fix/login\"\n  githelper --json \"stage README.md and commit with message update docs\"\n  githelper \"undo my last commit\"\n  githelper \"discard changes to README.md\"\n  githelper --doctor\n  githelper --interactive \"commit my changes\"\n  githelper --draft-commit --json\n  githelper \"I lost a commit\"\n\nCommands are printed for review. Nothing is executed."
 )]
 struct Cli {
     /// Request in plain language (quotes recommended)
@@ -92,6 +92,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .translate(&request, &context, &[])?
             .validate(&repository)?
     };
+    let plan = plan::validate_repository(plan, std::path::Path::new(&context.root))?;
     render_plan(&mut io::stdout().lock(), &plan, &context.root, cli.json)?;
     Ok(())
 }
@@ -340,5 +341,33 @@ Review these commands before running them in /repo.
             .unwrap();
         assert!(listed.status.success());
         assert!(listed.stdout.is_empty());
+    }
+
+    #[test]
+    fn discard_plan_renders_permanent_loss_warning() {
+        let proposal: plan::Proposal = serde_json::from_value(serde_json::json!({
+            "outcome": "ready",
+            "summary": "Discard README edits",
+            "clarification": "",
+            "steps": [{"action": "discard", "value": "", "paths": ["README.md"]}]
+        }))
+        .unwrap();
+        let plan = proposal.validate(std::path::Path::new(".")).unwrap();
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("lost permanently"));
+        assert!(text.contains("Warning: "));
+        assert!(text.contains("git --literal-pathspecs restore -- README.md"));
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["commands"][0]["destructive"], true);
+        assert!(
+            json["commands"][0]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("lost permanently")
+        );
     }
 }

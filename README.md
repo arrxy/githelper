@@ -36,6 +36,8 @@ cd ~/code/your-repository
 githelper "show my changes"
 githelper "create a branch called fix/login"
 githelper "stage README.md and commit with message update docs"
+githelper "undo my last commit"
+githelper "discard changes to README.md"
 githelper --repo ~/code/your-repository "show the last ten commits"
 githelper --json "list my branches"
 githelper --interactive "commit my changes"
@@ -139,13 +141,18 @@ There is no cloud fallback.
 | Push | Uses the configured upstream and Git defaults |
 | Pull | Fast-forward only |
 | Recover a lost commit or deleted branch | Reflog inspection, then a new `recovered/<name>` branch at a chosen commit |
+| Undo the last commit | `git reset --soft HEAD~1`. The commit is removed, nothing is lost, and changes stay staged. Warns if that commit is already on the upstream. A root commit asks for clarification instead. |
+| Discard changes to named files | Literal `git restore -- <path>`. Uncommitted changes to those files are lost permanently. |
 
 Multiple operations can form a plan of up to six steps. Missing commit messages,
+a discard with no file name, a discard of a clean file, a root-commit undo,
 ambiguous requests, unsupported flags, and unsupported operations return a
-clarification. Lost commits and deleted branches are recovered by creating a
-`recovered/<name>` branch. This version does not support reset, clean, discard,
-delete, merge, rebase, force push, dropped stashes, or custom remotes/refspecs.
-No recovery request produces `git reset`.
+clarification. Lost commits and deleted branches are recovered by inspecting
+the reflog and then creating a `recovered/<name>` branch. Undo is only a soft
+reset of `HEAD~1`. Discard names explicit paths and never means `git revert`.
+Hard resets, undoing more than one commit, discarding every change, clean,
+delete, merge, rebase, force push, dropped stashes, and custom remotes or
+refspecs are unsupported. No recovery request produces `git reset`.
 
 ## Recover lost work
 
@@ -179,7 +186,8 @@ non-hex values are rejected. Before that command is printed, githelper checks
 the object with read-only `git cat-file -e <sha>^{commit}`. If the name is
 missing, ambiguous, or not a commit, the result is a clarification and no
 commands. Resetting the current branch and recovering a dropped stash are out
-of scope.
+of scope for recovery. Undoing the latest commit is a separate soft reset, and
+discarding a named file is a literal restore.
 
 ## Clarification and commit subjects
 
@@ -250,14 +258,41 @@ Repository state can change between translation and execution.
 
 ```sh
 cargo test --locked
+cargo test --locked --features fake-model
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --locked --features fake-model -- -D warnings
+```
+
+### Testing the plan path without Apple Intelligence
+
+Linux cannot call the on-device model. The `fake-model` Cargo feature compiles
+a test stand-in so the path from request to `Plan::validate` to printed or
+`--json` output runs anywhere. It is off by default. A normal build ignores
+`GITHELPER_FAKE_MODEL`, and a release binary does not contain the stand-in.
+Do not ship a binary built with `--features fake-model`.
+
+With the feature enabled, set `GITHELPER_FAKE_MODEL` to one model-response JSON
+object, or to a path of a UTF-8 file containing one. Inline JSON is the value
+when it starts with `{`; anything else is a file path. The object uses the
+Swift bridge schema (`kind` of `plan`, `commit_message`, `status`, or `error`).
+Unset, that build behaves like a build without the feature. The variable
+applies to every model call in that process, including `--doctor` and
+`--draft-commit`. The stand-in only parses the fixture. Plans still go through
+`Plan::validate`, commit subjects still go through `CommitMessage::validate`,
+and githelper still only prints commands. Every current action is benign, so
+validated JSON omits `destructive` and `warning`. A fixture cannot invent those
+fields or an action such as `reset`; validation still rejects them.
+
+```sh
+GITHELPER_FAKE_MODEL='{"kind":"plan","plan":{"outcome":"ready","summary":"Show status","clarification":"","steps":[{"action":"status","value":"","paths":[]}]}}' \
+  cargo run --features fake-model -- --json "show status"
 ```
 
 The Rust core and CLI checks run on Linux without the Apple framework.
 Doctor pass/fail decisions are pure functions of probed facts, so Linux CI
-covers the check wording without Xcode or Apple Intelligence. Translation is
-available only on a supported Mac. These features are implemented; actual model
+covers the check wording without Xcode or Apple Intelligence. Real translation
+is available only on a supported Mac. These features are implemented; actual model
 inference and output quality remain unverified in this environment. macOS CI
 compiles the real Swift bridge; an Apple Intelligence-capable Mac is required
 to test actual inference, availability, refusal behavior, and translation
@@ -266,7 +301,8 @@ that ambiguous requests such as `githelper "commit my changes"` ask for
 clarification.
 
 Run the [on-device evaluation harness](evals/README.md) on a supported Mac to
-check real model responses against reproducible Git scenarios. Its separate
-Python plumbing tests run without inference.
+check real model responses against reproducible Git scenarios. CI runs the
+harness plumbing tests and `run.py --offline` for scenarios that fail before
+inference. Model-dependent scenarios stay on a supported Mac.
 
 MIT licensed.

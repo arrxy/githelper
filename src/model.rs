@@ -125,6 +125,14 @@ fn setup_failure(mode: &str, message: String) -> Box<dyn std::error::Error> {
 }
 
 fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error::Error>> {
+    // The stand-in is compiled only with `--features fake-model`. A default
+    // build has no branch here, so `GITHELPER_FAKE_MODEL` is ignored and the
+    // string is absent from the release binary.
+    #[cfg(feature = "fake-model")]
+    if let Some(response) = fake_model::from_env()? {
+        return Ok(response);
+    }
+
     #[cfg(not(target_os = "macos"))]
     {
         if request.mode == "doctor" {
@@ -187,6 +195,75 @@ fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error
             ));
         }
         Ok(response)
+    }
+}
+
+/// Test-only stand-in for the Apple model bridge.
+///
+/// Compiled only with `--features fake-model`, which is not a default feature.
+/// `GITHELPER_FAKE_MODEL` is either one model response JSON object, or a path to
+/// a UTF-8 file containing one. The value uses the Swift bridge schema (`kind`
+/// of `plan`, `commit_message`, `status`, or `error`). Unset, this build behaves
+/// like a build without the feature.
+///
+/// This path only reads and parses that JSON. It does not run Git. Callers still
+/// run `Proposal::validate` or `CommitMessage::validate` on success responses.
+#[cfg(feature = "fake-model")]
+mod fake_model {
+    use super::Response;
+
+    const MAX_FIXTURE_BYTES: u64 = 1_000_000;
+
+    pub(super) fn from_env() -> Result<Option<Response>, Box<dyn std::error::Error>> {
+        match std::env::var_os("GITHELPER_FAKE_MODEL") {
+            None => Ok(None),
+            Some(value) => {
+                let Some(value) = value.to_str() else {
+                    return Err("GITHELPER_FAKE_MODEL is not valid Unicode".into());
+                };
+                Ok(Some(parse(value)?))
+            }
+        }
+    }
+
+    pub(super) fn parse(value: &str) -> Result<Response, Box<dyn std::error::Error>> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("GITHELPER_FAKE_MODEL is set but empty".into());
+        }
+        let json = if value.starts_with('{') {
+            value.to_owned()
+        } else {
+            read_fixture(value)?
+        };
+        serde_json::from_str(json.trim()).map_err(|error| {
+            format!("GITHELPER_FAKE_MODEL is not a model response: {error}").into()
+        })
+    }
+
+    fn read_fixture(path: &str) -> Result<String, Box<dyn std::error::Error>> {
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            format!("could not read GITHELPER_FAKE_MODEL fixture {path}: {error}")
+        })?;
+        if !metadata.is_file() {
+            return Err(format!("GITHELPER_FAKE_MODEL fixture {path} is not a file").into());
+        }
+        if metadata.len() > MAX_FIXTURE_BYTES {
+            return Err(format!(
+                "GITHELPER_FAKE_MODEL fixture {path} exceeds {MAX_FIXTURE_BYTES} bytes"
+            )
+            .into());
+        }
+        let text = std::fs::read_to_string(path).map_err(|error| {
+            format!("could not read GITHELPER_FAKE_MODEL fixture {path}: {error}")
+        })?;
+        if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_FIXTURE_BYTES {
+            return Err(format!(
+                "GITHELPER_FAKE_MODEL fixture {path} exceeds {MAX_FIXTURE_BYTES} bytes"
+            )
+            .into());
+        }
+        Ok(text)
     }
 }
 
@@ -686,5 +763,82 @@ mod tests {
             .filter(|name| name.to_string_lossy().starts_with("githelper-model-"))
             .collect();
         assert_eq!(helpers.len(), 1);
+    }
+
+    #[cfg(feature = "fake-model")]
+    #[test]
+    fn fake_fixture_parses_a_model_response_and_still_validates() {
+        let response = super::fake_model::parse(
+            r#"{"kind":"plan","plan":{"outcome":"ready","summary":"Show status","clarification":"","steps":[{"action":"status","value":"","paths":[]}]}}"#,
+        )
+        .unwrap();
+        match response {
+            super::Response::Plan { plan } => {
+                let validated = plan.validate(std::path::Path::new(".")).unwrap();
+                assert_eq!(
+                    validated.commands[0].args,
+                    ["status", "--short", "--branch"].map(str::to_owned)
+                );
+                assert!(!validated.commands[0].destructive);
+                assert!(validated.commands[0].warning.is_none());
+            }
+            _ => panic!("expected a plan"),
+        }
+
+        let status = super::fake_model::parse(
+            r#"{"kind":"status","available":false,"detail":"fixture status"}"#,
+        )
+        .unwrap();
+        match status {
+            super::Response::Status { available, detail } => {
+                assert!(!available);
+                assert_eq!(detail, "fixture status");
+            }
+            _ => panic!("expected status"),
+        }
+
+        for fixture in [
+            "",
+            "   ",
+            "{",
+            r#"{"kind":"plan","plan":{"outcome":"ready","summary":"Reset","clarification":"","steps":[{"action":"reset","value":"--hard","paths":[]}]}}"#,
+            r#"{"kind":"plan","plan":{"outcome":"ready","summary":"Push","clarification":"","steps":[{"action":"push","value":"","paths":[],"destructive":true}]}}"#,
+            r#"{"kind":"plan","commands":["git","reset","--hard"]}"#,
+        ] {
+            assert!(
+                super::fake_model::parse(fixture).is_err(),
+                "accepted {fixture:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "fake-model")]
+    #[test]
+    fn fake_fixture_file_is_read_and_oversized_files_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("response.json");
+        std::fs::write(
+            &path,
+            "\n{\"kind\":\"commit_message\",\"commit_message\":{\"subject\":\"Fix ratio\"}}\n",
+        )
+        .unwrap();
+        let response = super::fake_model::parse(path.to_str().unwrap()).unwrap();
+        match response {
+            super::Response::CommitMessage { commit_message } => {
+                assert_eq!(commit_message.validate().unwrap().subject, "Fix ratio");
+            }
+            _ => panic!("expected a commit message"),
+        }
+
+        let huge = directory.path().join("huge.json");
+        std::fs::write(&huge, vec![b' '; 1_000_001]).unwrap();
+        match super::fake_model::parse(huge.to_str().unwrap()) {
+            Err(error) => assert!(error.to_string().contains("exceeds"), "{error}"),
+            Ok(_) => panic!("oversized fixture was accepted"),
+        }
+        match super::fake_model::parse(directory.path().to_str().unwrap()) {
+            Err(error) => assert!(error.to_string().contains("not a file"), "{error}"),
+            Ok(_) => panic!("directory fixture was accepted"),
+        }
     }
 }
