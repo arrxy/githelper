@@ -1,6 +1,8 @@
 # Githelper feature implementation plan
 
-Status: planned. These features are not implemented by this document.
+Status: implemented. Rust validation and fixture tests cover the new modes.
+Actual Apple model inference and translation quality remain unverified here;
+macOS compilation and on-device inference are separate validation gates.
 
 ## Delivery and review
 
@@ -52,7 +54,10 @@ What commit message should Git use?
 
 Default invocation remains one-shot. Interactive mode requires terminal input
 and conflicts with JSON, doctor, and drafting modes. Prompts go to stderr;
-only completed plans go to stdout. Blank input or EOF cancels without commands.
+only completed plans go to stdout. Blank input or EOF cancels without commands
+(exit 0). Invalid input, exhausted rounds, and model failures exit 1 without a
+partial plan. Unsupported and unresolved one-shot results remain successful
+outputs. Default JSON output is one-shot and never prompts.
 
 Add matching Rust/Swift proposal outcomes:
 
@@ -60,8 +65,9 @@ Add matching Rust/Swift proposal outcomes:
 - `needsClarification`: a question and zero steps.
 - `unsupported`: an explanation and zero steps; terminate immediately.
 
-Allow at most three answered questions and four inference calls. Bound each
-answer and the total conversation size; reject invalid input locally. Replay
+Allow at most three answered questions and four inference calls. Limit each
+answer to 1,000 bytes and question/answer history to 6,000 bytes; reject invalid
+input locally. Replay
 the original request and typed question/answer history with each helper call.
 Retain the existing single-request helper lifecycle. Treat repository metadata
 and conversation content as data and enforce all result invariants in Rust.

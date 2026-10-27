@@ -20,6 +20,14 @@ pub enum Action {
     Pull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Outcome {
+    Ready,
+    NeedsClarification,
+    Unsupported,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -31,6 +39,7 @@ pub struct Step {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
+    pub outcome: Outcome,
     pub summary: String,
     pub clarification: String,
     pub steps: Vec<Step>,
@@ -38,6 +47,7 @@ pub struct Proposal {
 
 #[derive(Debug, Serialize)]
 pub struct Plan {
+    pub outcome: Outcome,
     pub summary: String,
     pub clarification: Option<String>,
     pub commands: Vec<GitCommand>,
@@ -47,6 +57,7 @@ pub struct Plan {
 #[derive(Debug, Serialize)]
 pub struct GitCommand {
     pub program: &'static str,
+    pub explanation: String,
     pub args: Vec<String>,
 }
 
@@ -67,16 +78,20 @@ impl Proposal {
         if !text(&self.summary, 1_000) {
             return Err(invalid("missing or invalid summary"));
         }
-        if !self.clarification.is_empty() {
+        if self.outcome != Outcome::Ready {
             if !text(&self.clarification, 1_000) || !self.steps.is_empty() {
                 return Err(invalid("clarification must have no commands"));
             }
             return Ok(Plan {
+                outcome: self.outcome,
                 summary: self.summary,
                 clarification: Some(self.clarification),
                 commands: vec![],
                 changes_repository: false,
             });
+        }
+        if !self.clarification.is_empty() {
+            return Err(invalid("ready plans must not request clarification"));
         }
         if self.steps.is_empty() || self.steps.len() > 6 {
             return Err(invalid("expected one to six steps"));
@@ -149,15 +164,44 @@ impl Proposal {
                 !matches!(step.action, Status | Diff | StagedDiff | Log | ListBranches);
             commands.push(GitCommand {
                 program: "git",
+                explanation: step.action.explanation().into(),
                 args,
             });
         }
         Ok(Plan {
+            outcome: self.outcome,
             summary: self.summary,
             clarification: None,
             commands,
             changes_repository,
         })
+    }
+}
+
+impl Action {
+    fn explanation(self) -> &'static str {
+        match self {
+            Self::Status => "Shows short repository status and the current branch.",
+            Self::Diff => "Shows unstaged changes to tracked files.",
+            Self::StagedDiff => "Shows changes currently staged for commit.",
+            Self::Log => "Shows the ten most recent commits.",
+            Self::ListBranches => "Lists local branches.",
+            Self::CreateBranch => "Creates the named branch and switches to it.",
+            Self::SwitchBranch => "Switches to the named existing branch.",
+            Self::Stage => {
+                "Stages changes to the named literal paths, including additions and deletions."
+            }
+            Self::StageAll => "Stages all changes, including untracked files and deletions.",
+            Self::Unstage => "Unstages the named literal paths while keeping working-tree changes.",
+            Self::Commit => "Commits only staged changes using the supplied message.",
+            Self::Stash => "Stashes tracked changes, leaving untracked files alone.",
+            Self::Push => {
+                "Pushes using Git defaults and the configured upstream; contacts a remote."
+            }
+            Self::Pull => {
+                "Pulls from the configured upstream and updates by fast-forward only; contacts a remote."
+            }
+        }
     }
 }
 
@@ -212,6 +256,7 @@ mod tests {
 
     fn proposal(action: Action, value: &str, paths: &[&str]) -> Proposal {
         Proposal {
+            outcome: Outcome::Ready,
             summary: "Requested Git operation".into(),
             clarification: String::new(),
             steps: vec![Step {
@@ -220,6 +265,90 @@ mod tests {
                 paths: strings(paths),
             }],
         }
+    }
+
+    #[test]
+    fn every_action_has_a_scope_specific_explanation_and_preserves_order() {
+        use Action::*;
+        let cases = [
+            (Status, "", &[][..], "current branch", false),
+            (Diff, "", &[][..], "unstaged", false),
+            (StagedDiff, "", &[][..], "staged for commit", false),
+            (Log, "", &[][..], "ten most recent", false),
+            (ListBranches, "", &[][..], "local branches", false),
+            (CreateBranch, "feature/test", &[][..], "and switches", true),
+            (SwitchBranch, "main", &[][..], "existing branch", true),
+            (Stage, "", &["README.md"][..], "literal paths", true),
+            (StageAll, "", &[][..], "untracked files and deletions", true),
+            (
+                Unstage,
+                "",
+                &["README.md"][..],
+                "keeping working-tree",
+                true,
+            ),
+            (Commit, "update docs", &[][..], "only staged", true),
+            (Stash, "", &[][..], "leaving untracked", true),
+            (Push, "", &[][..], "Git defaults", true),
+            (Pull, "", &[][..], "fast-forward only", true),
+        ];
+        for (action, value, paths, scope, mutates) in cases {
+            let plan = proposal(action, value, paths).validate().unwrap();
+            assert!(plan.commands[0].explanation.contains(scope), "{action:?}");
+            assert_eq!(plan.changes_repository, mutates);
+            let json = serde_json::to_value(&plan).unwrap();
+            assert_eq!(json["outcome"], "ready");
+            assert_eq!(
+                json["commands"][0]["explanation"],
+                plan.commands[0].explanation
+            );
+            assert_eq!(json["commands"][0]["program"], "git");
+        }
+        let mut p = proposal(Stage, "", &["README.md"]);
+        p.steps.push(Step {
+            action: Commit,
+            value: "update docs".into(),
+            paths: vec![],
+        });
+        let plan = p.validate().unwrap();
+        assert!(plan.commands[0].explanation.contains("literal paths"));
+        assert!(plan.commands[1].explanation.contains("only staged"));
+        assert_eq!(
+            plan.commands[1].args,
+            strings(&["commit", "-m", "update docs"])
+        );
+    }
+
+    #[test]
+    fn outcome_invariants_fail_closed() {
+        for outcome in [Outcome::NeedsClarification, Outcome::Unsupported] {
+            let mut p = proposal(Action::Status, "", &[]);
+            p.outcome = outcome;
+            assert!(p.validate().is_err());
+            let mut p = proposal(Action::Status, "", &[]);
+            p.outcome = outcome;
+            p.steps.clear();
+            p.clarification = "Please provide supported intent.".into();
+            let plan = p.validate().unwrap();
+            assert_eq!(plan.outcome, outcome);
+            assert!(plan.commands.is_empty());
+            assert!(!plan.changes_repository);
+        }
+        let mut p = proposal(Action::Status, "", &[]);
+        p.clarification = "A question?".into();
+        assert!(p.validate().is_err());
+        let mut p = proposal(Action::Status, "", &[]);
+        p.steps.clear();
+        assert!(p.validate().is_err());
+        assert!(
+            serde_json::from_str::<Proposal>(r#"{"summary":"x","clarification":"","steps":[]}"#)
+                .is_err()
+        );
+        assert!(serde_json::from_str::<Outcome>(r#""unknown""#).is_err());
+        assert_eq!(
+            serde_json::to_string(&Outcome::NeedsClarification).unwrap(),
+            "\"needsClarification\""
+        );
     }
 
     #[test]
@@ -330,6 +459,7 @@ mod tests {
     #[test]
     fn clarification_cannot_hide_commands() {
         let mut p = proposal(Action::Push, "", &[]);
+        p.outcome = Outcome::NeedsClarification;
         p.clarification = "Which remote?".into();
         assert!(p.validate().is_err());
     }

@@ -44,3 +44,45 @@ fn doctor_reports_unsupported_platform_without_a_repository() {
     assert_eq!(json["available"], false);
     assert!(json["detail"].as_str().unwrap().contains("macOS 26"));
 }
+
+#[test]
+fn incompatible_modes_are_rejected() {
+    for arguments in [
+        vec!["--interactive", "--json", "show changes"],
+        vec!["--interactive", "--doctor"],
+        vec!["--interactive", "--draft-commit"],
+        vec!["--draft-commit", "--doctor"],
+        vec!["--draft-commit", "show changes"],
+    ] {
+        let output = cli().args(arguments).output().unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+    }
+}
+
+#[test]
+fn interactive_requires_a_terminal_without_reading_piped_input() {
+    let output = cli()
+        .args(["--interactive", "commit my changes"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("requires terminal input"));
+}
+
+#[test]
+fn draft_mode_does_not_require_a_positional_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = cli()
+        .arg("--repo")
+        .arg(directory.path())
+        .arg("--draft-commit")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("provide a request"));
+    assert!(output.stdout.is_empty());
+}

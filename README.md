@@ -9,6 +9,7 @@ githelper "show my staged changes"
 
 Show the changes currently staged for commit.
 
+Shows changes currently staged for commit.
   git diff --staged --no-ext-diff --no-textconv --
 ```
 
@@ -37,6 +38,9 @@ githelper "create a branch called fix/login"
 githelper "stage README.md and commit with message update docs"
 githelper --repo ~/code/your-repository "show the last ten commits"
 githelper --json "list my branches"
+githelper --interactive "commit my changes"
+githelper --draft-commit
+githelper --draft-commit --json
 ```
 
 If compilation cannot find Foundation Models, check `xcodebuild -version` and
@@ -69,6 +73,29 @@ clarification. This initial version does not support reset, clean, discard,
 delete, merge, rebase, force push, or custom remotes/refspecs. Add those as explicit
 typed operations with validation if you extend the tool.
 
+## Clarification and commit subjects
+
+Default translation, including `--json`, is one-shot. Missing information returns
+`needsClarification`; unsupported intent returns `unsupported`. Both produce no
+commands and remain successful one-shot results.
+
+Use `--interactive` to answer clarification questions in a terminal. It preserves
+the original request and previous answers, accepts at most three answers (four
+model calls), and limits each answer to 1,000 bytes and the question/answer history
+to 6,000 bytes. Prompts use stderr; only a completed plan uses stdout. Blank input
+or EOF cancels successfully (exit 0), without a plan. Invalid input, exhausted
+rounds, and model failures exit 1 without a partial plan. Unsupported requests
+stop immediately. Interactive mode conflicts with JSON, doctor, and drafting.
+
+`--draft-commit` proposes a single-line subject from the staged patch only. It
+neither stages nor commits. Plain output is the subject; JSON is
+`{"kind":"commit_message","subject":"..."}`. The staged patch is limited to
+6,000 bytes without truncation; subjects must be nonempty, contain no control
+characters, and fit within 200 bytes. Empty staging, unresolved conflicts,
+invalid encoding, and oversized patches return errors. Binary changes provide
+metadata only. Review the proposed subject before using it as an explicit
+message in a normal translation request.
+
 ## Design
 
 ```text
@@ -88,13 +115,17 @@ rejects malformed plans, unknown actions, unexpected arguments, invalid branch
 names, and paths that escape the repository lexically. File operations use
 `--literal-pathspecs` and `--` so filenames cannot become Git options or pathspec
 expressions. Displayed commands use POSIX shell quoting, suitable for zsh/bash.
-JSON output includes the executable and argument array for each command.
+JSON output includes the executable, argument array, and deterministic explanation
+for each command, plus an `outcome`: `ready`, `needsClarification`, or `unsupported`.
+Explanations come from validated Rust operations rather than model-generated prose.
 
-The local context contains the repository root, current branch, up to 32 local
-branch names, and up to 4,000 characters of tracked-file status. It contains no
+For normal translation, local context contains the repository root, current
+branch, up to 32 local branch names, and up to 4,000 characters of tracked-file status. It contains no
 file contents, diffs, remote URLs, or untracked filenames. Context is collected
 from the repository root even when invoked from a subdirectory. Instructions
-tell the model to treat this metadata as untrusted data.
+tell the model to treat this metadata as untrusted data. Commit drafting instead
+sends the bounded staged patch, including staged text content and binary-change
+metadata, without ordinary translation context.
 
 Inference stays on the Mac; there is no network inference fallback. The OS may
 need to download its model beforehand. A model can still misinterpret intent,
@@ -111,8 +142,9 @@ cargo clippy --all-targets --locked -- -D warnings
 ```
 
 The Rust core and CLI checks run on Linux without the Apple framework.
-Translation is available only on a supported Mac. macOS CI compiles the real
-Swift bridge; an Apple Intelligence-capable Mac is required to test actual
+Translation is available only on a supported Mac. These features are implemented;
+actual model inference and output quality remain unverified in this environment.
+macOS CI compiles the real Swift bridge; an Apple Intelligence-capable Mac is required to test actual
 inference, availability, refusal behavior, and translation quality. After
 `githelper --doctor` succeeds, try the requests above and check that ambiguous
 requests such as `githelper "commit my changes"` ask for clarification.
