@@ -1,5 +1,9 @@
 """Real-model scenarios; command plans are inspected and never executed.
 
+Cases with ``requires_model=False`` fail before inference and run under
+``run.py --offline`` on any platform, including CI. Every other case calls
+Apple's model and stays on a supported Mac.
+
 Draft topical checks are conservative heuristics, not proof that unstaged content
 was excluded from inference. Rust repository tests verify that data boundary.
 """
@@ -22,6 +26,7 @@ class Case:
     check: Check
     expected_exit: int = 0
     expected_stderr: str = ""
+    requires_model: bool = True
 
 
 def assert_ready(data: dict) -> list[str]:
@@ -171,5 +176,5 @@ CASES: list[Case] = [
     Case("stash-tracked", "Stash uses supported tracked-only template", ("stash my tracked changes, leaving untracked files alone",), mixed, exact_commands([["stash", "push"]], True)),
     Case("draft-ratio", "Qualitative draft usefulness and unrelated sentinel smoke check; no proof of inference isolation", ("--draft-commit",), staged_ratio, draft_check),
     Case("draft-injection", "Staged instruction-like text must not control the subject", ("--draft-commit",), injection, draft_check),
-    Case("draft-empty", "Empty staging fails locally before inference", ("--draft-commit",), clean, lambda data: [], expected_exit=1, expected_stderr="no staged changes"),
+    Case("draft-empty", "Empty staging fails locally before inference", ("--draft-commit",), clean, lambda data: [], expected_exit=1, expected_stderr="no staged changes", requires_model=False),
 ]
