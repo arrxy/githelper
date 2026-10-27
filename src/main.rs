@@ -124,6 +124,9 @@ fn render_plan(
         writeln!(output, "{}\n", plan.summary)?;
         for command in &plan.commands {
             writeln!(output, "{}", command.explanation)?;
+            if let Some(warning) = command.warning {
+                writeln!(output, "  Warning: {warning}")?;
+            }
             writeln!(output, "  {}", command.display())?;
         }
         writeln!(
@@ -161,12 +164,77 @@ mod tests {
             plan.commands[0].explanation,
             plan.commands[0].display()
         )));
+        assert!(!text.contains("Warning:"));
         let mut output = Vec::new();
         render_plan(&mut output, &plan, "/repo", true).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
             json["commands"][0]["explanation"],
             plan.commands[0].explanation
+        );
+        assert!(json["commands"][0].get("destructive").is_none());
+        assert!(json["commands"][0].get("warning").is_none());
+    }
+
+    #[test]
+    fn destructive_step_shows_warning_in_text_and_json() {
+        let plan = plan::Plan {
+            outcome: plan::Outcome::Ready,
+            summary: "Discard local edits".into(),
+            clarification: None,
+            commands: vec![
+                plan::GitCommand {
+                    program: "git",
+                    explanation: "Discards uncommitted changes in the working tree.".into(),
+                    args: vec![
+                        "restore".into(),
+                        "--worktree".into(),
+                        "--".into(),
+                        ".".into(),
+                    ],
+                    destructive: true,
+                    warning: Some("This permanently discards uncommitted work."),
+                },
+                plan::GitCommand {
+                    program: "git",
+                    explanation: "Shows short repository status and the current branch.".into(),
+                    args: vec!["status".into(), "--short".into(), "--branch".into()],
+                    destructive: false,
+                    warning: None,
+                },
+            ],
+            changes_repository: true,
+        };
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\
+Discard local edits
+
+Discards uncommitted changes in the working tree.
+  Warning: This permanently discards uncommitted work.
+  git restore --worktree -- .
+Shows short repository status and the current branch.
+  git status --short --branch
+
+Review these commands before running them in /repo.
+This plan changes repository state or contacts a remote.
+"
+        );
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["commands"][0]["destructive"], true);
+        assert_eq!(
+            json["commands"][0]["warning"],
+            "This permanently discards uncommitted work."
+        );
+        assert!(json["commands"][1].get("destructive").is_none());
+        assert!(json["commands"][1].get("warning").is_none());
+        assert_eq!(
+            json["commands"][1]["args"],
+            serde_json::json!(["status", "--short", "--branch"])
         );
     }
 
