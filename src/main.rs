@@ -16,7 +16,7 @@ use std::{
 #[command(
     version,
     about = "Plain language → Git commands, using Apple's on-device model.",
-    after_help = "Examples:\n  githelper \"show my staged changes\"\n  githelper --repo ~/code/app \"create a branch called fix/login\"\n  githelper --json \"stage README.md and commit with message update docs\"\n  githelper --doctor\n  githelper --interactive \"commit my changes\"\n  githelper --draft-commit --json\n\nCommands are printed for review. Nothing is executed."
+    after_help = "Examples:\n  githelper \"show my staged changes\"\n  githelper --repo ~/code/app \"create a branch called fix/login\"\n  githelper --json \"stage README.md and commit with message update docs\"\n  githelper --doctor\n  githelper --interactive \"commit my changes\"\n  githelper --draft-commit --json\n  githelper \"I lost a commit\"\n\nCommands are printed for review. Nothing is executed."
 )]
 struct Cli {
     /// Request in plain language (quotes recommended)
@@ -77,16 +77,20 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err("request must be at most 4,000 bytes and contain no control characters".into());
     }
     let context = repository::inspect(&cli.repo)?;
+    let repository = PathBuf::from(&context.root);
     let plan = if cli.interactive {
         let result = interaction::clarify(
             |history| bridge.translate(&request, &context, history),
+            &repository,
             &mut io::stdin().lock(),
             &mut io::stderr().lock(),
         )?;
         let Some(plan) = result else { return Ok(()) };
         plan
     } else {
-        bridge.translate(&request, &context, &[])?.validate()?
+        bridge
+            .translate(&request, &context, &[])?
+            .validate(&repository)?
     };
     render_plan(&mut io::stdout().lock(), &plan, &context.root, cli.json)?;
     Ok(())
@@ -155,7 +159,7 @@ mod tests {
             "steps":[{"action":"diff","value":"","paths":[]}]
         }))
         .unwrap();
-        let plan = proposal.validate().unwrap();
+        let plan = proposal.validate(std::path::Path::new(".")).unwrap();
         let mut output = Vec::new();
         render_plan(&mut output, &plan, "/repo", false).unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -250,5 +254,41 @@ This plan changes repository state or contacts a remote.
         let mut output = Vec::new();
         render_commit(&mut output, "Fix login", false).unwrap();
         assert_eq!(output, b"Fix login\n");
+    }
+
+    #[test]
+    fn recovery_reflog_renders_inspection_without_reset_or_warning() {
+        let proposal: plan::Proposal = serde_json::from_value(serde_json::json!({
+            "outcome": "ready",
+            "summary": "Recover the lost commit without moving the current branch.",
+            "clarification": "",
+            "steps": [{"action": "showReflog", "value": "", "paths": []}]
+        }))
+        .unwrap();
+        let plan = proposal.validate(std::path::Path::new(".")).unwrap();
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\
+Recover the lost commit without moving the current branch.
+
+Shows the 20 most recent reflog entries. Find the lost commit or deleted branch in that list and note its SHA, then ask to recover that SHA.
+  git reflog -n 20
+
+Review these commands before running them in /repo.
+"
+        );
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            json["commands"][0]["args"],
+            serde_json::json!(["reflog", "-n", "20"])
+        );
+        assert!(json["commands"][0].get("destructive").is_none());
+        assert!(json["commands"][0].get("warning").is_none());
+        assert_eq!(json["changes_repository"], false);
+        assert!(!json.to_string().contains("reset"));
     }
 }
