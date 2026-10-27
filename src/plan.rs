@@ -59,6 +59,16 @@ pub struct GitCommand {
     pub program: &'static str,
     pub explanation: String,
     pub args: Vec<String>,
+    /// Present in `--json` only when this step can discard work or rewrite history.
+    #[serde(skip_serializing_if = "is_false")]
+    pub destructive: bool,
+    /// Warning text for a destructive step. Omitted for every current action.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<&'static str>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Error)]
@@ -162,10 +172,15 @@ impl Proposal {
             };
             changes_repository |=
                 !matches!(step.action, Status | Diff | StagedDiff | Log | ListBranches);
+            let destructive = step.action.destructive();
+            let warning = step.action.warning();
+            debug_assert_eq!(destructive, warning.is_some());
             commands.push(GitCommand {
                 program: "git",
                 explanation: step.action.explanation().into(),
                 args,
+                destructive,
+                warning,
             });
         }
         Ok(Plan {
@@ -178,7 +193,64 @@ impl Proposal {
     }
 }
 
+/// Loss classification for one action.
+///
+/// `Action::safety` is the only match that decides this. Undo, discard, merge,
+/// and rebase should return `Destructive` with the warning a person reads
+/// before running the command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Safety {
+    Benign,
+    /// Undo, discard, merge, and rebase plug in as this variant.
+    #[expect(dead_code, reason = "no destructive action is implemented yet")]
+    Destructive(&'static str),
+}
+
 impl Action {
+    /// Whether this action can discard uncommitted work or rewrite history.
+    ///
+    /// Repository edits and ordinary remote sync are not destructive. Upcoming
+    /// undo, discard, merge, and rebase actions should return true here.
+    pub fn destructive(self) -> bool {
+        matches!(self.safety(), Safety::Destructive(_))
+    }
+
+    /// Warning copied onto a destructive step, in text output and `--json`.
+    pub fn warning(self) -> Option<&'static str> {
+        match self.safety() {
+            Safety::Benign => None,
+            Safety::Destructive(warning) => {
+                debug_assert!(
+                    !warning.is_empty() && !warning.chars().any(char::is_control),
+                    "destructive actions need a single-line warning"
+                );
+                Some(warning)
+            }
+        }
+    }
+
+    fn safety(self) -> Safety {
+        match self {
+            // Read-only inspection, local edits, and ordinary remote sync do not
+            // discard work. Classify undo, discard, merge, and rebase as
+            // `Safety::Destructive("...")` in this match.
+            Self::Status
+            | Self::Diff
+            | Self::StagedDiff
+            | Self::Log
+            | Self::ListBranches
+            | Self::CreateBranch
+            | Self::SwitchBranch
+            | Self::Stage
+            | Self::StageAll
+            | Self::Unstage
+            | Self::Commit
+            | Self::Stash
+            | Self::Push
+            | Self::Pull => Safety::Benign,
+        }
+    }
+
     fn explanation(self) -> &'static str {
         match self {
             Self::Status => "Shows short repository status and the current branch.",
@@ -490,5 +562,89 @@ mod tests {
                 .unwrap()
                 .changes_repository
         );
+    }
+
+    macro_rules! each_action {
+        ($($action:ident => $value:expr, $paths:expr;)*) => {
+            fn each_action(
+                mut visit: impl FnMut(Action, &'static str, &'static [&'static str]),
+            ) {
+                $(visit(Action::$action, $value, $paths);)*
+            }
+
+            fn every_variant_is_listed(action: Action) {
+                match action {
+                    $(Action::$action => {} )*
+                }
+            }
+        };
+    }
+
+    each_action! {
+        Status => "", &[];
+        Diff => "", &[];
+        StagedDiff => "", &[];
+        Log => "", &[];
+        ListBranches => "", &[];
+        CreateBranch => "feature/test", &[];
+        SwitchBranch => "main", &[];
+        Stage => "", &["README.md"];
+        Unstage => "", &["README.md"];
+        StageAll => "", &[];
+        Commit => "update docs", &[];
+        Stash => "", &[];
+        Push => "", &[];
+        Pull => "", &[];
+    }
+
+    #[test]
+    fn safety_metadata_is_paired_and_current_actions_are_benign() {
+        each_action(|action, value, paths| {
+            every_variant_is_listed(action);
+            assert_eq!(
+                action.destructive(),
+                action.warning().is_some(),
+                "{action:?}"
+            );
+            assert!(!action.destructive(), "{action:?}");
+            assert_eq!(action.warning(), None, "{action:?}");
+            let command = &proposal(action, value, paths).validate().unwrap().commands[0];
+            assert_eq!(command.destructive, action.destructive());
+            assert_eq!(command.warning, action.warning());
+            let json = serde_json::to_value(command).unwrap();
+            assert!(json.get("destructive").is_none(), "{action:?}: {json}");
+            assert!(json.get("warning").is_none(), "{action:?}: {json}");
+        });
+    }
+
+    #[test]
+    fn destructive_command_serializes_flag_and_warning() {
+        let command = GitCommand {
+            program: "git",
+            explanation: "Discards uncommitted changes in the working tree.".into(),
+            args: strings(&["restore", "--worktree", "--", "."]),
+            destructive: true,
+            warning: Some("This permanently discards uncommitted work."),
+        };
+        assert_eq!(
+            serde_json::to_value(&command).unwrap(),
+            serde_json::json!({
+                "program": "git",
+                "explanation": "Discards uncommitted changes in the working tree.",
+                "args": ["restore", "--worktree", "--", "."],
+                "destructive": true,
+                "warning": "This permanently discards uncommitted work."
+            })
+        );
+        let benign = GitCommand {
+            program: "git",
+            explanation: "Shows short repository status and the current branch.".into(),
+            args: strings(&["status", "--short", "--branch"]),
+            destructive: false,
+            warning: None,
+        };
+        let json = serde_json::to_value(&benign).unwrap();
+        assert!(json.get("destructive").is_none());
+        assert!(json.get("warning").is_none());
     }
 }

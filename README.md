@@ -48,10 +48,12 @@ If compilation cannot find Foundation Models, check `xcodebuild -version` and
 developer directory before rebuilding.
 
 The build script compiles the Swift bridge and embeds it inside the Rust
-executable. At inference time it extracts the helper into a private temporary
-directory, exchanges JSON over stdin/stdout, and removes it afterward. You can
-move the built executable without separately installing the bridge. Build
-natively for each Mac architecture; cross-compilation is not supported.
+executable. At inference time the helper is stored in a private directory under
+the user cache, named by a hash of that exact binary. It is written atomically
+with owner-only permissions and reused only when the cached file still matches.
+The process exchanges JSON over stdin/stdout. You can move the built executable
+without separately installing the bridge. Build natively for each Mac
+architecture; cross-compilation is not supported.
 
 ## Supported requests
 
@@ -117,7 +119,9 @@ names, and paths that escape the repository lexically. File operations use
 expressions. Displayed commands use POSIX shell quoting, suitable for zsh/bash.
 JSON output includes the executable, argument array, and deterministic explanation
 for each command, plus an `outcome`: `ready`, `needsClarification`, or `unsupported`.
-Explanations come from validated Rust operations rather than model-generated prose.
+A destructive step also includes `destructive: true` and the warning text shown
+ahead of that command. Explanations and warnings come from validated Rust
+operations rather than model-generated prose.
 
 For normal translation, local context contains the repository root, current
 branch, up to 32 local branch names, and up to 4,000 characters of tracked-file status. It contains no

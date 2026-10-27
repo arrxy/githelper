@@ -112,15 +112,10 @@ fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error
     {
         use std::{
             io::Write,
-            os::unix::fs::PermissionsExt,
             process::{Command, Stdio},
         };
         const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/githelper-model"));
-        // Each invocation gets a fresh helper; typed history replays prior clarification.
-        let directory = tempfile::tempdir()?;
-        let helper = directory.path().join("githelper-model");
-        std::fs::write(&helper, HELPER)?;
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700))?;
+        let helper = helper_cache::cached_helper_path(HELPER, &helper_cache::user_cache_dir()?)?;
         let mut child = Command::new(helper)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -143,9 +138,261 @@ fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error
     }
 }
 
+#[cfg(any(test, target_os = "macos"))]
+mod helper_cache {
+    use std::{
+        fs::{self, File, OpenOptions},
+        io::{Read, Write},
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    /// Directory that holds one cached copy of each embedded helper build.
+    #[cfg(target_os = "macos")]
+    pub(super) fn user_cache_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let xdg = std::env::var_os("XDG_CACHE_HOME");
+        let home = std::env::var_os("HOME");
+        resolve_cache_dir(xdg.as_deref(), home.as_deref(), cfg!(target_os = "macos"))
+            .map_err(Into::into)
+    }
+
+    pub(super) fn resolve_cache_dir(
+        xdg_cache_home: Option<&std::ffi::OsStr>,
+        home: Option<&std::ffi::OsStr>,
+        macos_layout: bool,
+    ) -> Result<PathBuf, &'static str> {
+        if let Some(xdg) = xdg_cache_home.filter(|value| !value.is_empty()) {
+            return Ok(Path::new(xdg).join("githelper"));
+        }
+        let home = match home {
+            Some(home) if !home.is_empty() => home,
+            _ => return Err("could not locate a user cache directory"),
+        };
+        let home = Path::new(home);
+        Ok(if macos_layout {
+            home.join("Library/Caches/githelper")
+        } else {
+            home.join(".cache/githelper")
+        })
+    }
+
+    /// Return a private, verified path to `bytes`, installing it on first use.
+    ///
+    /// The file name is a content id, so a new build does not reuse an older
+    /// helper. Reuse still requires the same owner, mode `0700`, and exact bytes.
+    pub(super) fn cached_helper_path(
+        bytes: &[u8],
+        cache_dir: &Path,
+    ) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        if bytes.is_empty() {
+            return Err("embedded model helper is empty".into());
+        }
+        ensure_private_dir(cache_dir)?;
+        let path = cache_dir.join(format!("githelper-model-{}", content_id(bytes)));
+        for _ in 0..2 {
+            if verified_helper(&path, bytes) {
+                return Ok(path);
+            }
+            install_helper(&path, bytes)?;
+        }
+        if verified_helper(&path, bytes) {
+            Ok(path)
+        } else {
+            Err("cached model helper failed verification".into())
+        }
+    }
+
+    /// FNV-1a 128-bit. This only selects the cache path; it is not the integrity check.
+    pub(super) fn content_id(bytes: &[u8]) -> String {
+        let mut hash = 0x6c62272e07bb014262b821756295c58d_u128;
+        const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013B;
+        for byte in bytes {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        format!("{hash:032x}")
+    }
+
+    fn current_uid() -> u32 {
+        // SAFETY: geteuid is the POSIX effective-uid getter. On Linux and macOS it
+        // returns a 32-bit uid_t and has no preconditions.
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        // SAFETY: geteuid only reads the calling process's credential.
+        unsafe { geteuid() }
+    }
+
+    fn ensure_private_dir(dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        match fs::symlink_metadata(dir) {
+            Ok(meta) => {
+                if !meta.file_type().is_dir() {
+                    return Err(
+                        format!("model cache path {} is not a directory", dir.display()).into(),
+                    );
+                }
+                if meta.uid() != current_uid() {
+                    return Err(format!(
+                        "model cache directory {} is not owned by the current user",
+                        dir.display()
+                    )
+                    .into());
+                }
+                if meta.permissions().mode() & 0o7777 != 0o700 {
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(
+                        |error| {
+                            format!(
+                                "could not restrict model cache directory {}: {error}",
+                                dir.display()
+                            )
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(dir).map_err(|error| {
+                    format!(
+                        "could not create model cache directory {}: {error}",
+                        dir.display()
+                    )
+                })?;
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+                    format!(
+                        "could not restrict model cache directory {}: {error}",
+                        dir.display()
+                    )
+                })?;
+                let meta = fs::symlink_metadata(dir)?;
+                if !meta.file_type().is_dir() || meta.uid() != current_uid() {
+                    return Err(format!(
+                        "model cache directory {} is not a private directory",
+                        dir.display()
+                    )
+                    .into());
+                }
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "could not inspect model cache directory {}: {error}",
+                dir.display()
+            )
+            .into()),
+        }
+    }
+
+    fn install_helper(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let parent = path.parent().ok_or("model cache path has no directory")?;
+        ensure_private_dir(parent)?;
+        let temporary = parent.join(format!(
+            ".githelper-model.{}.{}.tmp",
+            std::process::id(),
+            unique_suffix()
+        ));
+        if let Err(error) = write_private_file(&temporary, bytes) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        // A directory cannot be replaced by rename(2). Symlinks are replaced, not followed.
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.file_type().is_dir()
+            && let Err(error) = fs::remove_dir(path)
+        {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "could not replace model cache directory {}: {error}",
+                path.display()
+            )
+            .into());
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "could not install model helper into {}: {error}",
+                path.display()
+            )
+            .into());
+        }
+        if let Ok(directory) = File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    }
+
+    fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o700)
+            .open(path)
+            .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+        // open(2) applies the umask, so set the mode explicitly before the file is visible
+        // under its final name.
+        file.set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("could not restrict {}: {error}", path.display()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        file.sync_all()
+            .map_err(|error| format!("could not persist {}: {error}", path.display()))?;
+        Ok(())
+    }
+
+    fn unique_suffix() -> u128 {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tick = u128::from(COUNTER.fetch_add(1, Ordering::Relaxed));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        nanos ^ (u128::from(std::process::id()) << 64) ^ tick
+    }
+
+    pub(super) fn verified_helper(path: &Path, bytes: &[u8]) -> bool {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        if !meta.file_type().is_file() || meta.uid() != current_uid() {
+            return false;
+        }
+        if meta.permissions().mode() & 0o7777 != 0o700 {
+            return false;
+        }
+        if u64::try_from(bytes.len()).ok() != Some(meta.len()) {
+            return false;
+        }
+        let Ok(file) = File::open(path) else {
+            return false;
+        };
+        let Ok(opened) = file.metadata() else {
+            return false;
+        };
+        if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
+            return false;
+        }
+        contents_match(&file, bytes)
+    }
+
+    fn contents_match(file: &File, expected: &[u8]) -> bool {
+        let limit = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+        let mut found = Vec::new();
+        file.take(limit.saturating_add(1))
+            .read_to_end(&mut found)
+            .is_ok()
+            && found == expected
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::helper_cache::{cached_helper_path, content_id, resolve_cache_dir, verified_helper};
     use super::*;
+    use std::{
+        fs,
+        os::unix::fs::{MetadataExt, PermissionsExt},
+        path::PathBuf,
+    };
 
     #[test]
     fn draft_request_contains_only_staged_patch() {
@@ -209,5 +456,157 @@ mod tests {
             }
             _ => panic!("wrong response"),
         }
+    }
+
+    #[test]
+    fn content_id_is_stable_fnv_1a_128() {
+        assert_eq!(content_id(b""), "6c62272e07bb014262b821756295c58d");
+        assert_eq!(content_id(b"a"), "d228cb696f1a8caf78912b704e4a8964");
+        assert_eq!(content_id(b"githelper"), "0605dd5db2060b4c8d313d7c90ac73bf");
+        assert_ne!(content_id(b"a"), content_id(b"b"));
+    }
+
+    #[test]
+    fn cache_dir_uses_xdg_then_platform_home() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            resolve_cache_dir(
+                Some(OsStr::new("/var/cache")),
+                Some(OsStr::new("/home/me")),
+                false
+            )
+            .unwrap(),
+            PathBuf::from("/var/cache/githelper")
+        );
+        assert_eq!(
+            resolve_cache_dir(Some(OsStr::new("")), Some(OsStr::new("/home/me")), true).unwrap(),
+            PathBuf::from("/home/me/Library/Caches/githelper")
+        );
+        assert_eq!(
+            resolve_cache_dir(None, Some(OsStr::new("/home/me")), false).unwrap(),
+            PathBuf::from("/home/me/.cache/githelper")
+        );
+        assert_eq!(
+            resolve_cache_dir(None, Some(OsStr::new("/Users/me")), true).unwrap(),
+            PathBuf::from("/Users/me/Library/Caches/githelper")
+        );
+        assert!(resolve_cache_dir(None, None, false).is_err());
+        assert!(resolve_cache_dir(Some(OsStr::new("")), Some(OsStr::new("")), true).is_err());
+    }
+
+    fn mode(path: &std::path::Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn helper_is_installed_once_and_reused_only_when_it_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        let bytes = b"githelper-model-v1";
+        let path = cached_helper_path(bytes, &cache).unwrap();
+        assert_eq!(
+            path.file_name().unwrap().to_str().unwrap(),
+            format!("githelper-model-{}", content_id(bytes))
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(mode(&path), 0o700);
+        assert_eq!(mode(&cache), 0o700);
+        let inode = fs::metadata(&path).unwrap().ino();
+        assert_eq!(cached_helper_path(bytes, &cache).unwrap(), path);
+        assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+
+        let other = cached_helper_path(b"githelper-model-v2", &cache).unwrap();
+        assert_ne!(other, path);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read(&other).unwrap(), b"githelper-model-v2");
+
+        fs::write(&path, b"tampered").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let replaced = cached_helper_path(bytes, &cache).unwrap();
+        assert_eq!(replaced, path);
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(mode(&path), 0o700);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let inode = fs::metadata(&path).unwrap().ino();
+        cached_helper_path(bytes, &cache).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(mode(&path), 0o700);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+
+        let names: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.to_string_lossy().ends_with(".tmp"))
+        );
+    }
+
+    #[test]
+    fn symlink_cache_entries_are_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let target_dir = root.path().join("target");
+        fs::create_dir(&target_dir).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+        let error = cached_helper_path(b"helper", &link).unwrap_err();
+        assert!(error.to_string().contains("not a directory"), "{error}");
+        assert!(fs::read_dir(&target_dir).unwrap().next().is_none());
+
+        let cache = root.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let planted = root.path().join("planted");
+        fs::write(&planted, b"do-not-touch").unwrap();
+        let bytes = b"real-helper";
+        let path = cache.join(format!("githelper-model-{}", content_id(bytes)));
+        std::os::unix::fs::symlink(&planted, &path).unwrap();
+        let installed = cached_helper_path(bytes, &cache).unwrap();
+        assert_eq!(installed, path);
+        assert!(
+            fs::symlink_metadata(&installed)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        assert_eq!(fs::read(&planted).unwrap(), b"do-not-touch");
+        assert_eq!(mode(&installed), 0o700);
+    }
+
+    #[test]
+    fn empty_helper_and_non_directory_cache_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        assert!(cached_helper_path(b"", root.path()).is_err());
+        let file = root.path().join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        assert!(cached_helper_path(b"helper", &file).is_err());
+    }
+
+    #[test]
+    fn concurrent_installs_leave_one_verified_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let bytes = b"same-helper-bytes";
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let path = cached_helper_path(bytes, &cache).unwrap();
+                    assert!(verified_helper(&path, bytes));
+                    assert_eq!(mode(&path), 0o700);
+                });
+            }
+        });
+        let helpers: Vec<_> = fs::read_dir(&cache)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().starts_with("githelper-model-"))
+            .collect();
+        assert_eq!(helpers.len(), 1);
     }
 }
