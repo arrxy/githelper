@@ -149,4 +149,8 @@ inference, availability, refusal behavior, and translation quality. After
 `githelper --doctor` succeeds, try the requests above and check that ambiguous
 requests such as `githelper "commit my changes"` ask for clarification.
 
+Run the [on-device evaluation harness](evals/README.md) on a supported Mac to
+check real model responses against reproducible Git scenarios. Its separate
+Python plumbing tests run without inference.
+
 MIT licensed.
