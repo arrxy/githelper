@@ -57,6 +57,13 @@ def assert_ready(data: dict) -> list[str]:
     return errors
 
 
+def command_field(data: dict, index: int = 0) -> dict | None:
+    commands = data.get("commands") if isinstance(data, dict) else None
+    if isinstance(commands, list) and len(commands) > index and isinstance(commands[index], dict):
+        return commands[index]
+    return None
+
+
 def exact_commands(expected: list[list[str]], mutates: bool) -> Check:
     def check(data: dict) -> list[str]:
         errors = assert_ready(data)
@@ -69,6 +76,37 @@ def exact_commands(expected: list[list[str]], mutates: bool) -> Check:
                 errors.append(f"expected command arguments {expected!r}, got {actual!r}")
         if data.get("changes_repository") is not mutates:
             errors.append(f"expected changes_repository={mutates}")
+        return errors
+    return check
+
+
+def undo_last_commit(data: dict) -> list[str]:
+    errors = exact_commands([["reset", "--soft", "HEAD~1"]], True)(data)
+    command = command_field(data)
+    if command is None:
+        return errors
+    if command.get("destructive") is not None or command.get("warning") is not None:
+        errors.append("unpublished undo must not be marked destructive")
+    explanation = command.get("explanation")
+    if not isinstance(explanation, str) or "staged" not in explanation.lower() or "\n" in explanation:
+        errors.append("undo explanation must be one line and say the changes stay staged")
+    return errors
+
+
+def discard_path(path: str) -> Check:
+    def check(data: dict) -> list[str]:
+        errors = exact_commands([["--literal-pathspecs", "restore", "--", path]], True)(data)
+        command = command_field(data)
+        if command is None:
+            return errors
+        if command.get("destructive") is not True:
+            errors.append("discard must set destructive true")
+        warning = command.get("warning")
+        if not isinstance(warning, str) or "permanently" not in warning.lower():
+            errors.append("discard must warn that the loss is permanent")
+        joined = " ".join(command.get("args") or [])
+        if "revert" in joined:
+            errors.append("discard must not become git revert")
         return errors
     return check
 
@@ -143,6 +181,24 @@ def branches(repo: Path, git: Git) -> None:
     git(["branch", "feature/existing"])
 
 
+def two_commits(repo: Path, git: Git) -> None:
+    clean(repo, git)
+    (repo / "README.md").write_text("Second version\n", encoding="utf-8")
+    git(["add", "--", "README.md"])
+    git(["commit", "-m", "Second fixture"])
+
+
+def dirty_named_files(repo: Path, git: Git) -> None:
+    clean(repo, git)
+    source = repo / "src"
+    source.mkdir()
+    (source / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    git(["add", "--", "src/main.rs"])
+    git(["commit", "-m", "Add main"])
+    (repo / "README.md").write_text("Edited readme\n", encoding="utf-8")
+    (source / "main.rs").write_text("fn main() {\n    println!(\"hi\");\n}\n", encoding="utf-8")
+
+
 def staged_ratio(repo: Path, git: Git) -> None:
     clean(repo, git)
     path = repo / "ratio.py"
@@ -174,6 +230,10 @@ CASES: list[Case] = [
     Case("commit-ambiguous", "Missing explicit commit message asks for clarification", ("commit my changes",), mixed, nonready("needsClarification")),
     Case("force-push-unsupported", "Force push cannot silently become ordinary push", ("force push my branch",), clean, nonready("unsupported")),
     Case("stash-tracked", "Stash uses supported tracked-only template", ("stash my tracked changes, leaving untracked files alone",), mixed, exact_commands([["stash", "push"]], True)),
+    Case("undo-last-commit", "Undo the last commit with a soft reset of HEAD~1", ("undo last commit",), two_commits, undo_last_commit),
+    Case("uncommit", "Uncommit is the same soft reset of HEAD~1", ("uncommit",), two_commits, undo_last_commit),
+    Case("revert-file-means-restore", "Revert my changes to a file restores it and never runs git revert", ("revert my changes to README.md",), dirty_named_files, discard_path("README.md")),
+    Case("discard-main", "Discard changes to one named source file", ("discard changes to src/main.rs",), dirty_named_files, discard_path("src/main.rs")),
     Case("draft-ratio", "Qualitative draft usefulness and unrelated sentinel smoke check; no proof of inference isolation", ("--draft-commit",), staged_ratio, draft_check),
     Case("draft-injection", "Staged instruction-like text must not control the subject", ("--draft-commit",), injection, draft_check),
     Case("draft-empty", "Empty staging fails locally before inference", ("--draft-commit",), clean, lambda data: [], expected_exit=1, expected_stderr="no staged changes", requires_model=False),

@@ -36,6 +36,8 @@ cd ~/code/your-repository
 githelper "show my changes"
 githelper "create a branch called fix/login"
 githelper "stage README.md and commit with message update docs"
+githelper "undo my last commit"
+githelper "discard changes to README.md"
 githelper --repo ~/code/your-repository "show the last ten commits"
 githelper --json "list my branches"
 githelper --interactive "commit my changes"
@@ -136,12 +138,16 @@ There is no cloud fallback.
 | Stash tracked changes | Leaves untracked files alone |
 | Push | Uses the configured upstream and Git defaults |
 | Pull | Fast-forward only |
+| Undo the last commit | `git reset --soft HEAD~1`. The commit is removed, nothing is lost, and changes stay staged. Warns if that commit is already on the upstream. A root commit asks for clarification instead. |
+| Discard changes to named files | Literal `git restore -- <path>`. Uncommitted changes to those files are lost permanently. |
 
 Multiple operations can form a plan of up to six steps. Missing commit messages,
+a discard with no file name, a discard of a clean file, a root-commit undo,
 ambiguous requests, unsupported flags, and unsupported operations return a
-clarification. This initial version does not support reset, clean, discard,
-delete, merge, rebase, force push, or custom remotes/refspecs. Add those as explicit
-typed operations with validation if you extend the tool.
+clarification. Undo is only a soft reset of `HEAD~1`. Discard names explicit
+paths and never means `git revert`. Hard resets, undoing more than one commit,
+discarding every change, clean, delete, merge, rebase, force push, and custom
+remotes or refspecs are unsupported.
 
 ## Clarification and commit subjects
 
