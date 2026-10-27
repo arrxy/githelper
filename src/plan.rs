@@ -1121,3 +1121,7 @@ mod tests {
         assert!(!plan.changes_repository);
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_edge_tests.rs"]
+mod recovery_edge_tests;
