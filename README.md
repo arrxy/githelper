@@ -209,14 +209,41 @@ Repository state can change between translation and execution.
 
 ```sh
 cargo test --locked
+cargo test --locked --features fake-model
 cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
+cargo clippy --all-targets --locked --features fake-model -- -D warnings
+```
+
+### Testing the plan path without Apple Intelligence
+
+Linux cannot call the on-device model. The `fake-model` Cargo feature compiles
+a test stand-in so the path from request to `Plan::validate` to printed or
+`--json` output runs anywhere. It is off by default. A normal build ignores
+`GITHELPER_FAKE_MODEL`, and a release binary does not contain the stand-in.
+Do not ship a binary built with `--features fake-model`.
+
+With the feature enabled, set `GITHELPER_FAKE_MODEL` to one model-response JSON
+object, or to a path of a UTF-8 file containing one. Inline JSON is the value
+when it starts with `{`; anything else is a file path. The object uses the
+Swift bridge schema (`kind` of `plan`, `commit_message`, `status`, or `error`).
+Unset, that build behaves like a build without the feature. The variable
+applies to every model call in that process, including `--doctor` and
+`--draft-commit`. The stand-in only parses the fixture. Plans still go through
+`Plan::validate`, commit subjects still go through `CommitMessage::validate`,
+and githelper still only prints commands. Every current action is benign, so
+validated JSON omits `destructive` and `warning`. A fixture cannot invent those
+fields or an action such as `reset`; validation still rejects them.
+
+```sh
+GITHELPER_FAKE_MODEL='{"kind":"plan","plan":{"outcome":"ready","summary":"Show status","clarification":"","steps":[{"action":"status","value":"","paths":[]}]}}' \
+  cargo run --features fake-model -- --json "show status"
 ```
 
 The Rust core and CLI checks run on Linux without the Apple framework.
 Doctor pass/fail decisions are pure functions of probed facts, so Linux CI
-covers the check wording without Xcode or Apple Intelligence. Translation is
-available only on a supported Mac. These features are implemented; actual model
+covers the check wording without Xcode or Apple Intelligence. Real translation
+is available only on a supported Mac. These features are implemented; actual model
 inference and output quality remain unverified in this environment. macOS CI
 compiles the real Swift bridge; an Apple Intelligence-capable Mac is required
 to test actual inference, availability, refusal behavior, and translation
@@ -225,7 +252,8 @@ that ambiguous requests such as `githelper "commit my changes"` ask for
 clarification.
 
 Run the [on-device evaluation harness](evals/README.md) on a supported Mac to
-check real model responses against reproducible Git scenarios. Its separate
-Python plumbing tests run without inference.
+check real model responses against reproducible Git scenarios. CI runs the
+harness plumbing tests and `run.py --offline` for scenarios that fail before
+inference. Model-dependent scenarios stay on a supported Mac.
 
 MIT licensed.
