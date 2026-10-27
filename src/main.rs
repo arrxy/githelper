@@ -1,8 +1,10 @@
 mod commit_message;
+mod doctor;
 mod interaction;
 mod model;
 mod plan;
 mod repository;
+mod setup_text;
 
 use clap::Parser;
 use std::{
@@ -25,7 +27,7 @@ struct Cli {
     /// Print structured JSON, including command argument arrays
     #[arg(long)]
     json: bool,
-    /// Check whether Apple's on-device model is available
+    /// Check macOS, Xcode, Apple Intelligence, Git, and the current repository
     #[arg(long, conflicts_with = "request")]
     doctor: bool,
     /// Ask up to three clarification questions using terminal input
@@ -47,14 +49,14 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let bridge = model::AppleModel;
     if cli.doctor {
-        let status = bridge.status()?;
+        let report = doctor::diagnose(&cli.repo);
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&status)?);
+            println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            println!("{}", status.detail);
+            print!("{}", doctor::render_text(&report));
         }
-        if !status.available {
-            return Err("on-device model unavailable".into());
+        if !report.ok {
+            return Err(report.failure_summary().into());
         }
         return Ok(());
     }

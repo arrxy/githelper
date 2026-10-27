@@ -92,8 +92,35 @@ impl AppleModel {
 
 fn invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error::Error>> {
     match platform_invoke(request)? {
-        Response::Error { error } => Err(error.into()),
+        Response::Error { error } => Err(annotate_setup_error(request.mode, error).into()),
         response => Ok(response),
+    }
+}
+
+fn annotate_setup_error(mode: &str, error: String) -> String {
+    if mode == "doctor" || !is_setup_error(&error) {
+        error
+    } else {
+        crate::setup_text::with_doctor_hint(&error)
+    }
+}
+
+fn is_setup_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unavailable")
+        || lower.contains("apple intelligence")
+        || lower.contains("macos 26")
+        || lower.contains("on-device model")
+        || lower.contains("model bridge")
+        || lower.contains("model helper")
+}
+
+/// Doctor prints its own fix hints. Other commands point at `--doctor`.
+fn setup_failure(mode: &str, message: String) -> Box<dyn std::error::Error> {
+    if mode == "doctor" {
+        message.into()
+    } else {
+        crate::setup_text::with_doctor_hint(&message).into()
     }
 }
 
@@ -103,10 +130,13 @@ fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error
         if request.mode == "doctor" {
             return Ok(Response::Status {
                 available: false,
-                detail: "Requires macOS 26+ on an Apple Intelligence-capable Mac with Apple Intelligence enabled and its model downloaded.".into(),
+                detail: crate::setup_text::MODEL_UNSUPPORTED_PLATFORM.into(),
             });
         }
-        Err("Apple's on-device model requires macOS 26+; run githelper on a supported Mac. There is no cloud fallback.".into())
+        Err(setup_failure(
+            request.mode,
+            crate::setup_text::MODEL_RUNTIME_UNSUPPORTED.into(),
+        ))
     }
     #[cfg(target_os = "macos")]
     {
@@ -125,19 +155,41 @@ fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .spawn()?;
-        let mut input = child.stdin.take().ok_or("could not open model input")?;
+            .spawn()
+            .map_err(|error| {
+                setup_failure(
+                    request.mode,
+                    format!("Could not start the Apple model bridge ({error})."),
+                )
+            })?;
+        let mut input = child.stdin.take().ok_or_else(|| {
+            setup_failure(
+                request.mode,
+                "Could not open the Apple model bridge input.".into(),
+            )
+        })?;
         input.write_all(&serde_json::to_vec(request)?)?;
         drop(input);
-        let output = child.wait_with_output()?;
-        let response: Response = serde_json::from_slice(&output.stdout).map_err(|e| {
-            format!(
-                "could not read Apple model response ({e}); helper: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+        let output = child.wait_with_output().map_err(|error| {
+            setup_failure(
+                request.mode,
+                format!("The Apple model bridge failed ({error})."),
+            )
+        })?;
+        let response: Response = serde_json::from_slice(&output.stdout).map_err(|error| {
+            setup_failure(
+                request.mode,
+                format!(
+                    "Could not read the Apple model response ({error}); helper: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
             )
         })?;
         if !output.status.success() {
-            return Err("Apple model helper failed".into());
+            return Err(setup_failure(
+                request.mode,
+                "The Apple model bridge failed.".into(),
+            ));
         }
         Ok(response)
     }
@@ -184,6 +236,32 @@ mod tests {
             serde_json::json!({"question":"Message?","answer":"Fix docs"})
         );
         assert!(value.get("staged_diff").is_none());
+    }
+
+    #[test]
+    fn setup_failures_point_at_doctor_outside_doctor_mode() {
+        let runtime = setup_failure(
+            "translate",
+            crate::setup_text::MODEL_RUNTIME_UNSUPPORTED.into(),
+        );
+        let text = runtime.to_string();
+        assert!(text.contains("githelper --doctor"));
+        assert!(text.contains("macOS 26"));
+        assert!(text.contains("Apple Intelligence"));
+        let during_doctor = setup_failure(
+            "doctor",
+            "Could not start the Apple model bridge (missing).".into(),
+        );
+        assert!(!during_doctor.to_string().contains("githelper --doctor"));
+        let unavailable = annotate_setup_error(
+            "translate",
+            "Apple model unavailable: deviceNotEligible.".into(),
+        );
+        assert!(unavailable.contains("githelper --doctor"));
+        let already = annotate_setup_error("translate", unavailable.clone());
+        assert_eq!(already, unavailable);
+        let programming = annotate_setup_error("translate", "Invalid translation request.".into());
+        assert!(!programming.contains("githelper --doctor"));
     }
 
     #[test]
