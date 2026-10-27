@@ -1,8 +1,10 @@
 mod commit_message;
+mod doctor;
 mod interaction;
 mod model;
 mod plan;
 mod repository;
+mod setup_text;
 
 use clap::Parser;
 use std::{
@@ -25,7 +27,7 @@ struct Cli {
     /// Print structured JSON, including command argument arrays
     #[arg(long)]
     json: bool,
-    /// Check whether Apple's on-device model is available
+    /// Check macOS, Xcode, Apple Intelligence, Git, and the current repository
     #[arg(long, conflicts_with = "request")]
     doctor: bool,
     /// Ask up to three clarification questions using terminal input
@@ -47,14 +49,14 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let bridge = model::AppleModel;
     if cli.doctor {
-        let status = bridge.status()?;
+        let report = doctor::diagnose(&cli.repo);
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&status)?);
+            println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            println!("{}", status.detail);
+            print!("{}", doctor::render_text(&report));
         }
-        if !status.available {
-            return Err("on-device model unavailable".into());
+        if !report.ok {
+            return Err(report.failure_summary().into());
         }
         return Ok(());
     }
@@ -122,6 +124,9 @@ fn render_plan(
         writeln!(output, "{}\n", plan.summary)?;
         for command in &plan.commands {
             writeln!(output, "{}", command.explanation)?;
+            if let Some(warning) = command.warning {
+                writeln!(output, "  Warning: {warning}")?;
+            }
             writeln!(output, "  {}", command.display())?;
         }
         writeln!(
@@ -159,12 +164,77 @@ mod tests {
             plan.commands[0].explanation,
             plan.commands[0].display()
         )));
+        assert!(!text.contains("Warning:"));
         let mut output = Vec::new();
         render_plan(&mut output, &plan, "/repo", true).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
             json["commands"][0]["explanation"],
             plan.commands[0].explanation
+        );
+        assert!(json["commands"][0].get("destructive").is_none());
+        assert!(json["commands"][0].get("warning").is_none());
+    }
+
+    #[test]
+    fn destructive_step_shows_warning_in_text_and_json() {
+        let plan = plan::Plan {
+            outcome: plan::Outcome::Ready,
+            summary: "Discard local edits".into(),
+            clarification: None,
+            commands: vec![
+                plan::GitCommand {
+                    program: "git",
+                    explanation: "Discards uncommitted changes in the working tree.".into(),
+                    args: vec![
+                        "restore".into(),
+                        "--worktree".into(),
+                        "--".into(),
+                        ".".into(),
+                    ],
+                    destructive: true,
+                    warning: Some("This permanently discards uncommitted work."),
+                },
+                plan::GitCommand {
+                    program: "git",
+                    explanation: "Shows short repository status and the current branch.".into(),
+                    args: vec!["status".into(), "--short".into(), "--branch".into()],
+                    destructive: false,
+                    warning: None,
+                },
+            ],
+            changes_repository: true,
+        };
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\
+Discard local edits
+
+Discards uncommitted changes in the working tree.
+  Warning: This permanently discards uncommitted work.
+  git restore --worktree -- .
+Shows short repository status and the current branch.
+  git status --short --branch
+
+Review these commands before running them in /repo.
+This plan changes repository state or contacts a remote.
+"
+        );
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["commands"][0]["destructive"], true);
+        assert_eq!(
+            json["commands"][0]["warning"],
+            "This permanently discards uncommitted work."
+        );
+        assert!(json["commands"][1].get("destructive").is_none());
+        assert!(json["commands"][1].get("warning").is_none());
+        assert_eq!(
+            json["commands"][1]["args"],
+            serde_json::json!(["status", "--short", "--branch"])
         );
     }
 
