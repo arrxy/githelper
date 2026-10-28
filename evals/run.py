@@ -118,7 +118,11 @@ def run_case(case, binary: Path, artifact_dir: Path, timeout: float,
         hooks.mkdir()
         for key, value in [("user.name", "Githelper Eval"), ("user.email", "eval@example.invalid"),
                            ("core.hooksPath", str(hooks)), ("commit.gpgSign", "false"),
-                           ("tag.gpgSign", "false"), ("core.autocrlf", "false")]:
+                           ("tag.gpgSign", "false"), ("core.autocrlf", "false"),
+                           # Keep Git from starting background maintenance that writes
+                           # .git/objects/maintenance.lock while the repo is snapshotted.
+                           ("maintenance.auto", "false"), ("gc.auto", "0"),
+                           ("gc.autoDetach", "false")]:
             git(["config", "--local", key, value])
         case.setup(repo, git)
         before = snapshot_tree(repo)
