@@ -10,7 +10,24 @@ use clap::Parser;
 use std::{
     io::{self, IsTerminal, Write},
     path::PathBuf,
+    time::Instant,
 };
+
+fn timings_enabled() -> bool {
+    matches!(
+        std::env::var("GITHELPER_TIMINGS").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE")
+    )
+}
+
+fn timing(label: &str, start: Instant) {
+    if timings_enabled() {
+        eprintln!(
+            "githelper.timing {label}={:.3}ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -39,14 +56,18 @@ struct Cli {
 }
 
 fn main() {
+    let process_started = Instant::now();
     let cli = Cli::parse();
+    timing("cli_parse_ms", process_started);
     if let Err(error) = run(cli) {
         eprintln!("githelper: {error}");
         std::process::exit(1);
     }
+    timing("process_wall_ms", process_started);
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let run_started = Instant::now();
     let bridge = model::AppleModel;
     if cli.doctor {
         let report = doctor::diagnose(&cli.repo);
@@ -76,7 +97,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if request.len() > 4_000 || request.chars().any(char::is_control) {
         return Err("request must be at most 4,000 bytes and contain no control characters".into());
     }
+    let context_started = Instant::now();
     let context = repository::inspect(&cli.repo)?;
+    timing("repo_context_ms", context_started);
     let repository = PathBuf::from(&context.root);
     let plan = if cli.interactive {
         let result = interaction::clarify(
@@ -88,12 +111,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let Some(plan) = result else { return Ok(()) };
         plan
     } else {
-        bridge
-            .translate(&request, &context, &[])?
-            .validate(&repository)?
+        let model_started = Instant::now();
+        let proposal = bridge.translate(&request, &context, &[])?;
+        timing("model_call_ms", model_started);
+        let validate_started = Instant::now();
+        let plan = proposal.validate(&repository)?;
+        timing("plan_validation_ms", validate_started);
+        plan
     };
+    let repo_validate_started = Instant::now();
     let plan = plan::validate_repository(plan, std::path::Path::new(&context.root))?;
+    timing("repo_validation_ms", repo_validate_started);
     render_plan(&mut io::stdout().lock(), &plan, &context.root, cli.json)?;
+    timing("total_after_startup_ms", run_started);
     Ok(())
 }
 

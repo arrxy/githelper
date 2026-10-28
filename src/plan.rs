@@ -227,11 +227,17 @@ fn text(value: &str, maximum: usize) -> bool {
 }
 
 impl Proposal {
-    pub fn validate(self, repository: &Path) -> Result<Plan, InvalidPlan> {
+    pub fn validate(mut self, repository: &Path) -> Result<Plan, InvalidPlan> {
         if !text(&self.summary, 1_000) {
             return Err(invalid("missing or invalid summary"));
         }
         if self.outcome != Outcome::Ready {
+            // Unsupported refusals sometimes still include leftover steps from the
+            // on-device model. Drop them. NeedsClarification with steps still fails
+            // closed so a clarification cannot hide commands.
+            if self.outcome == Outcome::Unsupported {
+                self.steps.clear();
+            }
             if !text(&self.clarification, 1_000) || !self.steps.is_empty() {
                 return Err(invalid("clarification must have no commands"));
             }
@@ -243,9 +249,20 @@ impl Proposal {
                 changes_repository: false,
             });
         }
+        // Models sometimes mark ready while also filling clarification. Empty
+        // steps mean they meant needsClarification; otherwise keep the plan and
+        // drop the stray clarification text.
         if !self.clarification.is_empty() {
-            return Err(invalid("ready plans must not request clarification"));
+            if self.steps.is_empty() {
+                return Ok(state_plan(
+                    Outcome::NeedsClarification,
+                    self.summary.clone(),
+                    self.clarification.clone(),
+                ));
+            }
+            self.clarification.clear();
         }
+        self.steps = self.steps.into_iter().map(normalize_step_fields).collect();
         if self.steps.is_empty() || self.steps.len() > 6 {
             return Err(invalid("expected one to six steps"));
         }
@@ -363,7 +380,13 @@ impl Proposal {
                 StageAll => strings(&["add", "--all"]),
                 Commit => {
                     if !text(&step.value, 1_000) {
-                        return Err(invalid("commit requires an explicit message"));
+                        // Models sometimes emit commit without a message instead of
+                        // needsClarification; treat that as a clarification outcome.
+                        return Ok(state_plan(
+                            Outcome::NeedsClarification,
+                            self.summary.clone(),
+                            "What commit message should be used?",
+                        ));
                     }
                     vec!["commit".into(), "-m".into(), step.value]
                 }
@@ -659,6 +682,55 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// Move mis-filed model output into the fields each action accepts.
+/// Newer on-device builds often put stage/discard filenames in `value`.
+/// Newer on-device builds often put stage/unstage/discard filenames in `value`
+/// instead of `paths`. Move that filename into `paths` when `paths` is empty.
+/// For stage/unstage, also drop a redundant `value` when `paths` is already set.
+/// Discard keeps a non-empty `value` when `paths` is set so validation still
+/// fails closed on hostile extras like `--hard`.
+fn normalize_step_fields(mut step: Step) -> Step {
+    use Action::*;
+    match &step.action {
+        Stage | Unstage => {
+            if step.paths.is_empty() && !step.value.trim().is_empty() {
+                step.paths.push(std::mem::take(&mut step.value));
+            } else if !step.value.is_empty() {
+                step.value.clear();
+            }
+        }
+        Discard if step.paths.is_empty() && !step.value.trim().is_empty() => {
+            step.paths.push(std::mem::take(&mut step.value));
+        }
+        Discard => {}
+        _ => {}
+    }
+    if matches!(&step.action, Stage | Unstage | Discard) {
+        for path in &mut step.paths {
+            *path = strip_wrapping_quotes(path);
+        }
+    }
+    step
+}
+
+fn strip_wrapping_quotes(path: &str) -> String {
+    let trimmed = path.trim();
+    let pairs = [
+        ('"', '"'),
+        ('\'', '\''),
+        ('`', '`'),
+        ('\u{201c}', '\u{201d}'),
+        ('"', '\u{201d}'),
+        ('\u{201c}', '"'),
+    ];
+    for (open, close) in pairs {
+        if trimmed.len() >= 2 && trimmed.starts_with(open) && trimmed.ends_with(close) {
+            return trimmed[open.len_utf8()..trimmed.len() - close.len_utf8()].to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
 fn validate_branch(branch: &str) -> Result<(), InvalidPlan> {
     // A deliberately conservative subset of git-check-ref-format's branch syntax.
     if !text(branch, 200)
@@ -871,6 +943,41 @@ mod tests {
     }
 
     #[test]
+    fn stage_moves_misfiled_value_into_paths() {
+        let plan = proposal(Action::Stage, "notes with spaces.txt", &[])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(
+            plan.commands[0].args,
+            strings(&["--literal-pathspecs", "add", "--", "notes with spaces.txt"])
+        );
+        let literal = proposal(Action::Stage, "--all", &[])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(
+            literal.commands[0].args,
+            strings(&["--literal-pathspecs", "add", "--", "--all"])
+        );
+        let redundant = proposal(Action::Stage, "README.md", &["README.md"])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(
+            redundant.commands[0].args,
+            strings(&["--literal-pathspecs", "add", "--", "README.md"])
+        );
+    }
+
+    #[test]
+    fn unsupported_outcome_drops_leftover_steps() {
+        let mut p = proposal(Action::Push, "", &[]);
+        p.outcome = Outcome::Unsupported;
+        p.clarification = "Force push is not supported.".into();
+        let plan = p.validate(Path::new(".")).unwrap();
+        assert!(plan.commands.is_empty());
+        assert_eq!(plan.outcome, Outcome::Unsupported);
+    }
+
+    #[test]
     fn stage_treats_flags_and_pathspec_magic_as_literal_files() {
         let plan = proposal(Action::Stage, "", &["--all", ":(glob)*", "a b.txt"])
             .validate(Path::new("."))
@@ -991,11 +1098,11 @@ mod tests {
                 .validate(Path::new("."))
                 .is_err()
         );
-        assert!(
-            proposal(Action::Commit, "", &[])
-                .validate(Path::new("."))
-                .is_err()
-        );
+        let empty_commit = proposal(Action::Commit, "", &[])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(empty_commit.outcome, Outcome::NeedsClarification);
+        assert!(empty_commit.commands.is_empty());
     }
 
     #[test]

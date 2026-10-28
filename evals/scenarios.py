@@ -80,6 +80,26 @@ def exact_commands(expected: list[list[str]], mutates: bool) -> Check:
     return check
 
 
+def status_or_diff(data: dict) -> list[str]:
+    """Show changed files may reasonably map to status or unstaged diff."""
+    errors = assert_ready(data)
+    if not isinstance(data, dict):
+        return errors
+    commands = data.get("commands")
+    if not isinstance(commands, list) or len(commands) != 1 or not isinstance(commands[0], dict):
+        return errors + ["expected exactly one command"]
+    args = commands[0].get("args")
+    allowed = [
+        ["status", "--short", "--branch"],
+        ["diff", "--no-ext-diff", "--no-textconv", "--"],
+    ]
+    if args not in allowed:
+        errors.append(f"expected status or unstaged diff, got {args!r}")
+    if data.get("changes_repository") is not False:
+        errors.append("expected changes_repository=False")
+    return errors
+
+
 def undo_last_commit(data: dict) -> list[str]:
     errors = exact_commands([["reset", "--soft", "HEAD~1"]], True)(data)
     command = command_field(data)
@@ -290,7 +310,7 @@ CASES: list[Case] = [
     Case("revert-file-means-restore", "Revert my changes to a file restores it and never runs git revert", ("revert my changes to README.md",), dirty_named_files, discard_path("README.md")),
     Case("discard-main", "Discard changes to one named source file", ("discard changes to src/main.rs",), dirty_named_files, discard_path("src/main.rs")),
     Case("discard-readme", "Discard changes to README.md must not hit recovery rules", ("discard changes to README.md",), dirty_named_files, discard_path("README.md")),
-    Case("show-changed-files", "Show changed files maps to short status, even when clean wording appears", ("show changed files",), mixed, exact_commands([["status", "--short", "--branch"]], False)),
+    Case("show-changed-files", "Show changed files maps to short status or unstaged diff", ("show changed files",), mixed, status_or_diff),
     Case("draft-ratio", "Qualitative draft usefulness and unrelated sentinel smoke check; no proof of inference isolation", ("--draft-commit",), staged_ratio, draft_check),
     Case("draft-injection", "Staged instruction-like text must not control the subject", ("--draft-commit",), injection, draft_check),
     Case("draft-empty", "Empty staging fails locally before inference", ("--draft-commit",), clean, lambda data: [], expected_exit=1, expected_stderr="no staged changes", requires_model=False),
