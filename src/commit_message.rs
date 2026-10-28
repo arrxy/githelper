@@ -63,7 +63,11 @@ fn sanitize_subject(raw: &str) -> String {
         }
         cleaned.push_str(token);
     }
-    cleaned.trim().trim_matches([':', '-', ',']).trim().to_owned()
+    cleaned
+        .trim()
+        .trim_matches([':', '-', ','])
+        .trim()
+        .to_owned()
 }
 
 fn strip_leading_sentinel(subject: &str) -> Option<String> {
@@ -98,9 +102,7 @@ fn looks_like_sentinel(token: &str) -> bool {
     if upper != token {
         return false;
     }
-    upper.ends_with("SENTINEL")
-        || upper.contains("PWNED")
-        || upper.contains("INJECT")
+    upper.ends_with("SENTINEL") || upper.contains("PWNED") || upper.contains("INJECT")
 }
 
 /// Remove added diff lines that look like prompt-injection instructions so the

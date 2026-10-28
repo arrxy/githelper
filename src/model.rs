@@ -1,4 +1,8 @@
-use crate::{commit_message::{sanitize_staged_patch, CommitMessage}, plan::Proposal, repository::Context};
+use crate::{
+    commit_message::{CommitMessage, sanitize_staged_patch},
+    plan::Proposal,
+    repository::Context,
+};
 use serde::{Deserialize, Serialize};
 
 pub struct AppleModel;
@@ -86,7 +90,7 @@ impl AppleModel {
             staged_diff: Some(&sanitized),
         })? {
             Response::CommitMessage { commit_message } => commit_message.validate(),
-            other => Err(format!("expected commit_message response, got {other:?}").into()),
+            _ => Err("unexpected model commit_message response".into()),
         }
     }
 }
