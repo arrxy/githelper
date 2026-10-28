@@ -415,15 +415,31 @@ mod helper_cache {
     fn install_helper(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
         let parent = path.parent().ok_or("model cache path has no directory")?;
         ensure_private_dir(parent)?;
-        let temporary = parent.join(format!(
-            ".githelper-model.{}.{}.tmp",
-            std::process::id(),
-            unique_suffix()
-        ));
-        if let Err(error) = write_private_file(&temporary, bytes) {
-            let _ = fs::remove_file(&temporary);
-            return Err(error);
+        // Retry on a rare temp-name collision rather than deleting another
+        // installer's in-flight file (create_new EEXIST + remove_file).
+        let mut temporary = None;
+        let mut last_error = None;
+        for _ in 0..8 {
+            let candidate = parent.join(format!(
+                ".githelper-model.{}.{}.tmp",
+                std::process::id(),
+                unique_suffix()
+            ));
+            match write_private_file(&candidate, bytes) {
+                Ok(()) => {
+                    temporary = Some(candidate);
+                    break;
+                }
+                Err(error) => {
+                    // Only remove our candidate if we created it; create_new
+                    // failures leave any colliding path alone.
+                    last_error = Some(error);
+                }
+            }
         }
+        let temporary = temporary.ok_or_else(|| {
+            last_error.unwrap_or_else(|| "could not create a private temp helper".into())
+        })?;
         // A directory cannot be replaced by rename(2). Symlinks are replaced, not followed.
         if let Ok(meta) = fs::symlink_metadata(path)
             && meta.file_type().is_dir()
@@ -470,16 +486,35 @@ mod helper_cache {
 
     fn unique_suffix() -> u128 {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
+        // Counter and time live in separate bit ranges so XOR cannot cancel
+        // and two threads cannot mint the same temp name.
         let tick = u128::from(COUNTER.fetch_add(1, Ordering::Relaxed));
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
-        nanos ^ (u128::from(std::process::id()) << 64) ^ tick
+        (tick << 64) ^ (nanos & 0xffff_ffff_ffff_ffff) ^ (u128::from(std::process::id()) << 48)
     }
 
+    // Linux includes O_NOFOLLOW as 0x20000. macOS uses 0x0100.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    const O_NOFOLLOW: i32 = 0x20000;
+
     pub(super) fn verified_helper(path: &Path, bytes: &[u8]) -> bool {
-        let Ok(meta) = fs::symlink_metadata(path) else {
+        // Open the inode we will judge. Concurrent installers publish a new
+        // inode with rename, so a path stat and a later open can name different
+        // files that are both valid copies. O_NOFOLLOW keeps a swapped symlink
+        // from being accepted in that window.
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(path)
+        else {
+            return false;
+        };
+        let Ok(meta) = file.metadata() else {
             return false;
         };
         if !meta.file_type().is_file() || meta.uid() != current_uid() {
@@ -489,15 +524,6 @@ mod helper_cache {
             return false;
         }
         if u64::try_from(bytes.len()).ok() != Some(meta.len()) {
-            return false;
-        }
-        let Ok(file) = File::open(path) else {
-            return false;
-        };
-        let Ok(opened) = file.metadata() else {
-            return false;
-        };
-        if opened.dev() != meta.dev() || opened.ino() != meta.ino() {
             return false;
         }
         contents_match(&file, bytes)
@@ -732,6 +758,24 @@ mod tests {
         assert_eq!(fs::read(&installed).unwrap(), bytes);
         assert_eq!(fs::read(&planted).unwrap(), b"do-not-touch");
         assert_eq!(mode(&installed), 0o700);
+
+        // A symlink whose target already matches the helper must still be replaced.
+        fs::remove_file(&installed).unwrap();
+        fs::write(&planted, bytes).unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o700)).unwrap();
+        let planted_inode = fs::metadata(&planted).unwrap().ino();
+        std::os::unix::fs::symlink(&planted, &path).unwrap();
+        let installed = cached_helper_path(bytes, &cache).unwrap();
+        assert!(
+            fs::symlink_metadata(&installed)
+                .unwrap()
+                .file_type()
+                .is_file()
+        );
+        assert_ne!(fs::metadata(&installed).unwrap().ino(), planted_inode);
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        assert_eq!(fs::read(&planted).unwrap(), bytes);
+        assert_eq!(mode(&planted), 0o700);
     }
 
     #[test]
