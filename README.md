@@ -43,6 +43,8 @@ githelper --json "list my branches"
 githelper --interactive "commit my changes"
 githelper --draft-commit
 githelper --draft-commit --json
+githelper "I lost a commit"
+githelper "recover the commit abc1234"
 ```
 
 `githelper --doctor` prints one pass or fail line per prerequisite. See
@@ -138,16 +140,54 @@ There is no cloud fallback.
 | Stash tracked changes | Leaves untracked files alone |
 | Push | Uses the configured upstream and Git defaults |
 | Pull | Fast-forward only |
+| Recover a lost commit or deleted branch | Reflog inspection, then a new `recovered/<name>` branch at a chosen commit |
 | Undo the last commit | `git reset --soft HEAD~1`. The commit is removed, nothing is lost, and changes stay staged. Warns if that commit is already on the upstream. A root commit asks for clarification instead. |
 | Discard changes to named files | Literal `git restore -- <path>`. Uncommitted changes to those files are lost permanently. |
 
 Multiple operations can form a plan of up to six steps. Missing commit messages,
 a discard with no file name, a discard of a clean file, a root-commit undo,
 ambiguous requests, unsupported flags, and unsupported operations return a
-clarification. Undo is only a soft reset of `HEAD~1`. Discard names explicit
-paths and never means `git revert`. Hard resets, undoing more than one commit,
-discarding every change, clean, delete, merge, rebase, force push, and custom
-remotes or refspecs are unsupported.
+clarification. Lost commits and deleted branches are recovered by inspecting
+the reflog and then creating a `recovered/<name>` branch. Undo is only a soft
+reset of `HEAD~1`. Discard names explicit paths and never means `git revert`.
+Hard resets, undoing more than one commit, discarding every change, clean,
+delete, merge, rebase, force push, dropped stashes, and custom remotes or
+refspecs are unsupported. No recovery request produces `git reset`.
+
+## Recover lost work
+
+"I lost a commit", "undo my reset", and "get back my deleted branch" print a
+read-only reflog inspection plus how to find the SHA. The current branch does
+not move.
+
+```text
+githelper "I lost a commit"
+
+Recover the lost commit without moving the current branch.
+
+Shows the 20 most recent reflog entries. Find the lost commit or deleted branch in that list and note its SHA, then ask to recover that SHA.
+  git reflog -n 20
+
+Review these commands before running them in /path/to/repo.
+```
+
+The summary line is model wording; the command and its explanation are fixed.
+When you name a SHA, or supply one through `--interactive`, the plan creates a
+branch and leaves the current branch where it is:
+
+```text
+Creates a branch at the recovered commit without moving the current branch.
+  git branch recovered/login abc1234
+```
+
+The branch is always under `recovered/`. A SHA must be 7 to 40 hexadecimal
+characters; either case is accepted and preserved. Shorter, longer, and
+non-hex values are rejected. Before that command is printed, githelper checks
+the object with read-only `git cat-file -e <sha>^{commit}`. If the name is
+missing, ambiguous, or not a commit, the result is a clarification and no
+commands. Resetting the current branch and recovering a dropped stash are out
+of scope for recovery. Undoing the latest commit is a separate soft reset, and
+discarding a named file is a literal restore.
 
 ## Clarification and commit subjects
 
@@ -188,7 +228,10 @@ Rust CLI → embedded Swift helper → Apple Foundation Models
 
 The model chooses typed operations rather than arbitrary shell strings. Rust
 rejects malformed plans, unknown actions, unexpected arguments, invalid branch
-names, and paths that escape the repository lexically. File operations use
+names, paths that escape the repository lexically, and commit SHAs that are not
+7 to 40 hexadecimal characters. Recovery only prints `git branch recovered/<name> <sha>`
+after `git cat-file -e <sha>^{commit}` confirms the object, and it never rewrites
+that request into `git reset`. File operations use
 `--literal-pathspecs` and `--` so filenames cannot become Git options or pathspec
 expressions. Displayed commands use POSIX shell quoting, suitable for zsh/bash.
 JSON output includes the executable, argument array, and deterministic explanation

@@ -193,7 +193,7 @@ class HarnessTests(unittest.TestCase):
         fixtures = []
 
         def doctor(command, cwd, env, timeout, stdout_path, stderr_path):
-            self.assertEqual(command, [str(self.binary), "--doctor", "--json"])
+            self.assertEqual(command, [str(self.binary.resolve()), "--doctor", "--json"])
             fixtures.append(cwd)
             stdout_path.write_text(json.dumps({"available": False, "detail": "Model unavailable"}))
             stderr_path.write_text("")
