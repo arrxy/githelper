@@ -112,11 +112,11 @@ pub fn sanitize_staged_patch(patch: &str) -> String {
     for line in patch.lines() {
         if is_instruction_like_added_line(line) {
             // Keep a neutral placeholder so hunk headers still line up roughly.
-            if let Some(rest) = line.strip_prefix('+') {
-                if !rest.starts_with('+') {
-                    out.push_str("+[redacted instruction-like staged text]\n");
-                    continue;
-                }
+            if let Some(rest) = line.strip_prefix('+')
+                && !rest.starts_with('+')
+            {
+                out.push_str("+[redacted instruction-like staged text]\n");
+                continue;
             }
         }
         out.push_str(line);
