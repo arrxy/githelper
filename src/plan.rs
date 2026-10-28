@@ -237,6 +237,9 @@ impl Proposal {
             // closed so a clarification cannot hide commands.
             if self.outcome == Outcome::Unsupported {
                 self.steps.clear();
+                if self.clarification.trim().is_empty() {
+                    self.clarification = self.summary.clone();
+                }
             }
             if !text(&self.clarification, 1_000) || !self.steps.is_empty() {
                 return Err(invalid("clarification must have no commands"));
@@ -676,9 +679,7 @@ fn strings(args: &[&str]) -> Vec<String> {
 /// Newer on-device builds often put stage/discard filenames in `value`.
 /// Newer on-device builds often put stage/unstage/discard filenames in `value`
 /// instead of `paths`. Move that filename into `paths` when `paths` is empty.
-/// For stage/unstage, also drop a redundant `value` when `paths` is already set.
-/// Discard keeps a non-empty `value` when `paths` is set so validation still
-/// fails closed on hostile extras like `--hard`.
+/// For stage/unstage/discard, also drop a stray `value` when `paths` is already set.
 fn normalize_step_fields(mut step: Step) -> Step {
     use Action::*;
     match &step.action {
@@ -689,10 +690,13 @@ fn normalize_step_fields(mut step: Step) -> Step {
                 step.value.clear();
             }
         }
-        Discard if step.paths.is_empty() && !step.value.trim().is_empty() => {
-            step.paths.push(std::mem::take(&mut step.value));
+        Discard => {
+            if step.paths.is_empty() && !step.value.trim().is_empty() {
+                step.paths.push(std::mem::take(&mut step.value));
+            } else if !step.paths.is_empty() {
+                step.value.clear();
+            }
         }
-        Discard => {}
         _ => {}
     }
     if matches!(&step.action, Stage | Unstage | Discard) {
@@ -890,10 +894,10 @@ mod tests {
 
     #[test]
     fn outcome_invariants_fail_closed() {
+        let mut p = proposal(Action::Status, "", &[]);
+        p.outcome = Outcome::NeedsClarification;
+        assert!(p.validate(Path::new(".")).is_err());
         for outcome in [Outcome::NeedsClarification, Outcome::Unsupported] {
-            let mut p = proposal(Action::Status, "", &[]);
-            p.outcome = outcome;
-            assert!(p.validate(Path::new(".")).is_err());
             let mut p = proposal(Action::Status, "", &[]);
             p.outcome = outcome;
             p.steps.clear();
@@ -965,10 +969,15 @@ mod tests {
     fn unsupported_outcome_drops_leftover_steps() {
         let mut p = proposal(Action::Push, "", &[]);
         p.outcome = Outcome::Unsupported;
-        p.clarification = "Force push is not supported.".into();
+        p.summary = "Force push is not supported.".into();
+        p.clarification = "  ".into();
         let plan = p.validate(Path::new(".")).unwrap();
         assert!(plan.commands.is_empty());
         assert_eq!(plan.outcome, Outcome::Unsupported);
+        assert_eq!(
+            plan.clarification.as_deref(),
+            Some("Force push is not supported.")
+        );
     }
 
     #[test]
@@ -1689,11 +1698,16 @@ mod tests {
                 "{path}"
             );
         }
-        assert!(
-            proposal(Action::Discard, "--hard", &["README.md"])
-                .validate(Path::new("."))
-                .is_err()
+        let stray_value = proposal(Action::Discard, "--hard", &["README.md"])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(stray_value.outcome, Outcome::Ready);
+        assert_eq!(
+            stray_value.commands[0].args,
+            strings(&["--literal-pathspecs", "restore", "--", "README.md"])
         );
+        assert!(stray_value.commands[0].destructive);
+        assert_eq!(stray_value.commands[0].warning, Some(DISCARD_WARNING));
 
         let plan = proposal(Action::Discard, "", &["README.md", "a b.txt"])
             .validate(Path::new("."))
