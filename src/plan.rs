@@ -179,7 +179,7 @@ impl From<&Action> for WireAction {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
     pub outcome: Outcome,
@@ -227,6 +227,38 @@ fn text(value: &str, maximum: usize) -> bool {
 }
 
 impl Proposal {
+    /// Like [`Self::validate`], but when validation fails and
+    /// `GITHELPER_DUMP_PROPOSAL` is set, writes the raw proposal JSON to that
+    /// path for eval/debug inspection. Normal CLI output is unchanged.
+    pub fn validate_dumping_on_failure(self, repository: &Path) -> Result<Plan, InvalidPlan> {
+        let dump_path = std::env::var_os("GITHELPER_DUMP_PROPOSAL")
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from);
+        self.validate_writing_dump_on_failure(repository, dump_path.as_deref())
+    }
+
+    fn validate_writing_dump_on_failure(
+        self,
+        repository: &Path,
+        dump_path: Option<&Path>,
+    ) -> Result<Plan, InvalidPlan> {
+        // Serialize before consume so a failed proposal can still be dumped.
+        let dump = dump_path.and_then(|path| {
+            serde_json::to_vec_pretty(&self)
+                .ok()
+                .map(|bytes| (path.to_path_buf(), bytes))
+        });
+        match self.validate(repository) {
+            Ok(plan) => Ok(plan),
+            Err(err) => {
+                if let Some((path, bytes)) = dump {
+                    let _ = std::fs::write(path, bytes);
+                }
+                Err(err)
+            }
+        }
+    }
+
     pub fn validate(mut self, repository: &Path) -> Result<Plan, InvalidPlan> {
         if !text(&self.summary, 1_000) {
             return Err(invalid("missing or invalid summary"));
@@ -754,6 +786,56 @@ fn validate_sha(sha: &str) -> Result<(), InvalidPlan> {
     Ok(())
 }
 
+/// When the user named a commit SHA and the model answered with a lone
+/// `showReflog` recovery plan, rewrite to `createBranchAt` for that SHA.
+/// Deterministic: never invents a SHA that was not in the request text.
+pub fn rewrite_named_sha_recovery(request: &str, mut proposal: Proposal) -> Proposal {
+    if proposal.outcome != Outcome::Ready || proposal.steps.len() != 1 {
+        return proposal;
+    }
+    if !matches!(proposal.steps[0].action, Action::ShowReflog) {
+        return proposal;
+    }
+    let Some(sha) = first_hex_sha_in_request(request) else {
+        return proposal;
+    };
+    proposal.steps[0] = Step {
+        action: Action::CreateBranchAt {
+            name: format!("recovered/{sha}"),
+            sha: sha.clone(),
+        },
+        value: String::new(),
+        paths: Vec::new(),
+        sha: String::new(),
+    };
+    if !text(&proposal.summary, 1_000) {
+        proposal.summary = format!("Recover commit {sha}");
+    }
+    proposal
+}
+
+/// First 7–40 character hexadecimal token in `request` bounded by non-hex characters.
+fn first_hex_sha_in_request(request: &str) -> Option<String> {
+    let bytes = request.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            let len = i - start;
+            if (7..=40).contains(&len) {
+                // Reject if adjacent to a longer hex run already consumed; token is exact.
+                return Some(request[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
 /// Force the printed branch under `recovered/` without moving the current branch.
 fn recovered_branch_name(name: &str, sha: &str) -> Result<String, InvalidPlan> {
     let branch = if name.is_empty() {
@@ -1037,6 +1119,49 @@ mod tests {
     }
 
     #[test]
+    fn dumps_raw_proposal_json_when_validation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-model-proposal.json");
+        let bad = Proposal {
+            outcome: Outcome::Ready,
+            summary: "stage escape".into(),
+            clarification: String::new(),
+            steps: vec![Step {
+                action: Action::Stage,
+                value: String::new(),
+                paths: vec!["../secret".into()],
+                sha: String::new(),
+            }],
+        };
+        let err = bad
+            .validate_writing_dump_on_failure(Path::new("."), Some(&path))
+            .expect_err("escape path must fail validation");
+        assert!(
+            err.to_string()
+                .contains("paths must stay inside the repository")
+        );
+        let dumped = std::fs::read_to_string(&path).expect("dump written");
+        let value: serde_json::Value = serde_json::from_str(&dumped).expect("valid json");
+        assert_eq!(value["steps"][0]["paths"][0], "../secret");
+        // Successful validation must not write the dump file.
+        let ok_path = dir.path().join("should-not-exist.json");
+        proposal(Action::Stage, "", &[":(glob)*"])
+            .validate_writing_dump_on_failure(Path::new("."), Some(&ok_path))
+            .expect("literal pathspec filename is valid");
+        assert!(!ok_path.exists(), "success must not create dump");
+        // No dump path: failure still returns the same error and writes nothing.
+        let missing = dir.path().join("never.json");
+        let err = proposal(Action::Stage, "", &["../secret"])
+            .validate_writing_dump_on_failure(Path::new("."), None)
+            .expect_err("escape path must fail");
+        assert!(
+            err.to_string()
+                .contains("paths must stay inside the repository")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn rejects_path_escape_and_control_characters() {
         for path in [
             "../secret",
@@ -1295,6 +1420,34 @@ mod tests {
         let json = serde_json::to_value(command).unwrap();
         assert!(json.get("destructive").is_none());
         assert!(json.get("warning").is_none());
+    }
+
+    #[test]
+    fn named_sha_in_request_rewrites_lone_show_reflog_to_create_branch_at() {
+        let request = "recover the commit abc1234";
+        let mut show = proposal(Action::ShowReflog, "", &[]);
+        show.summary = "Inspect the reflog".into();
+        let rewritten = rewrite_named_sha_recovery(request, show);
+        assert!(matches!(
+            &rewritten.steps[0].action,
+            Action::CreateBranchAt { name, sha }
+                if name == "recovered/abc1234" && sha == "abc1234"
+        ));
+        // Requests without a SHA stay on showReflog.
+        let kept =
+            rewrite_named_sha_recovery("I lost a commit", proposal(Action::ShowReflog, "", &[]));
+        assert!(matches!(kept.steps[0].action, Action::ShowReflog));
+        // Already-correct createBranchAt is left alone.
+        let ready = recovery("abc1234", "abc1234");
+        let same = rewrite_named_sha_recovery(request, ready.clone());
+        assert_eq!(
+            format!("{:?}", same.steps[0].action),
+            format!("{:?}", ready.steps[0].action)
+        );
+        // Hex shorter than 7 is ignored.
+        let short =
+            rewrite_named_sha_recovery("recover ab12", proposal(Action::ShowReflog, "", &[]));
+        assert!(matches!(short.steps[0].action, Action::ShowReflog));
     }
 
     #[test]

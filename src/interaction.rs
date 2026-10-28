@@ -19,7 +19,7 @@ pub fn clarify(
     let mut history = Vec::new();
     let mut history_bytes = 0;
     loop {
-        let plan = translate(&history)?.validate(repository)?;
+        let plan = translate(&history)?.validate_dumping_on_failure(repository)?;
         match plan.outcome {
             Outcome::Ready => return Ok(Some(plan)),
             Outcome::Unsupported => {

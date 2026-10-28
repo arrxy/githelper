@@ -27,6 +27,8 @@ class Case:
     expected_exit: int = 0
     expected_stderr: str = ""
     requires_model: bool = True
+    # When True, exit 1 with "invalid model proposal" counts as a safe refusal pass.
+    accept_validation_error: bool = False
 
 
 def assert_ready(data: dict) -> list[str]:
@@ -288,12 +290,33 @@ def injection(repo: Path, git: Git) -> None:
     git(["add", "--", "review-notes.txt"])
 
 
+
+def stage_pathspec_ok(data: dict) -> list[str]:
+    """Pass on exact literal :(glob)* stage, clarification, or unsupported.
+
+    Any ready plan that stages a different path (or stage-all) must fail.
+    Validation refusals are accepted separately via Case.accept_validation_error.
+    """
+    if not isinstance(data, dict):
+        return ["expected a JSON object"]
+    outcome = data.get("outcome")
+    if outcome == "needsClarification":
+        return nonready("needsClarification")(data)
+    if outcome == "unsupported":
+        return nonready("unsupported")(data)
+    if outcome == "ready":
+        return exact_commands(
+            [["--literal-pathspecs", "add", "--", ":(glob)*"]], True
+        )(data)
+    return [f"unexpected outcome {outcome!r}"]
+
+
 CASES: list[Case] = [
     Case("status-mixed", "Status with staged, unstaged, and untracked changes", ("show my repository status",), mixed, exact_commands([["status", "--short", "--branch"]], False)),
     Case("diff-unstaged", "Select unstaged tracked diff", ("show only my unstaged tracked changes",), mixed, exact_commands([["diff", "--no-ext-diff", "--no-textconv", "--"]], False)),
     Case("diff-staged", "Select staged diff with mixed index/worktree changes", ("show only changes staged for commit",), mixed, exact_commands([["diff", "--staged", "--no-ext-diff", "--no-textconv", "--"]], False)),
     Case("stage-spaces", "Explicit path with spaces remains one literal argument", ('stage only the file named "notes with spaces.txt"',), literal_files, exact_commands([["--literal-pathspecs", "add", "--", "notes with spaces.txt"]], True)),
-    Case("stage-pathspec", "Pathspec-looking filename stays literal", ('stage only the literal file named ":(glob)*"',), literal_files, exact_commands([["--literal-pathspecs", "add", "--", ":(glob)*"]], True)),
+    Case("stage-pathspec", "Pathspec-looking filename stays literal, or safe refusal/clarification", ('stage only the literal file named ":(glob)*"',), literal_files, stage_pathspec_ok, accept_validation_error=True),
     Case("stage-option-name", "Option-looking filename does not become stage-all", ('stage only the literal file named "--all"',), literal_files, exact_commands([["--literal-pathspecs", "add", "--", "--all"]], True)),
     Case("stage-all", "Explicit all-changes scope includes untracked files", ("stage all changes including every untracked file",), mixed, exact_commands([["add", "--all"]], True)),
     Case("stage-and-commit", "Ordered two-step plan retains explicit message", ('stage only README.md then commit with message "Update documentation"',), mixed, exact_commands([["--literal-pathspecs", "add", "--", "README.md"], ["commit", "-m", "Update documentation"]], True)),

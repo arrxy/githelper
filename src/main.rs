@@ -103,7 +103,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let repository = PathBuf::from(&context.root);
     let plan = if cli.interactive {
         let result = interaction::clarify(
-            |history| bridge.translate(&request, &context, history),
+            |history| {
+                let proposal = bridge.translate(&request, &context, history)?;
+                Ok(plan::rewrite_named_sha_recovery(&request, proposal))
+            },
             &repository,
             &mut io::stdin().lock(),
             &mut io::stderr().lock(),
@@ -114,8 +117,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let model_started = Instant::now();
         let proposal = bridge.translate(&request, &context, &[])?;
         timing("model_call_ms", model_started);
+        let proposal = plan::rewrite_named_sha_recovery(&request, proposal);
         let validate_started = Instant::now();
-        let plan = proposal.validate(&repository)?;
+        let plan = proposal.validate_dumping_on_failure(&repository)?;
         timing("plan_validation_ms", validate_started);
         plan
     };

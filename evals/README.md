@@ -45,8 +45,10 @@ contains overall results, platform/Python information, binary hash and size,
 and preflight status. Each case directory includes
 `result.json`, captured stdout/stderr, fixture setup logs, and before/after
 repository snapshots covering file hashes, modes, symlink targets, and Git
-internals. Inspect failure reasons and raw model output together. Reports and
-retained fixtures can contain the generated fixture patches and model output.
+internals. When plan validation fails, `raw-model-proposal.json` holds the
+model's raw proposal (eval/debug only; never printed by the normal CLI).
+Inspect failure reasons and that dump together. Reports and retained fixtures
+can contain the generated fixture patches and model output.
 
 Temporary repositories are removed after each case, including failures and
 setup errors. `--keep-failures` preserves failed fixtures only; their locations

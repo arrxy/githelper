@@ -207,12 +207,14 @@ struct ModelBridge {
                 Lost-commit or deleted-branch recovery with no user-supplied SHA needs no
                 clarification: return ready with one showReflog step. Never fabricate, infer,
                 or copy a SHA from these instructions or repository context. A SHA appearing in
-                the original user request is user-supplied; use it rather than showReflog.
+                the original user request is user-supplied; ALWAYS use createBranchAt with that
+                SHA rather than showReflog. Never answer a named-SHA recovery with showReflog.
                 createBranchAt: create a new branch named recovered/<name> at an existing commit SHA
                 without switching to it and without moving the current branch. value is recovered/<name>.
                 When the user request contains a valid 7 to 40 character hexadecimal commit SHA,
-                use createBranchAt with that exact SHA in sha and paths []. If the user did not
-                choose a branch name, value is recovered/<sha>. Never replace a supplied SHA.
+                ALWAYS emit exactly one createBranchAt step with that exact SHA in sha and paths [];
+                never showReflog in that case. If the user did not choose a branch name, value is
+                recovered/<sha>. Never replace a supplied SHA.
                 Recovery (showReflog and createBranchAt only) never uses reset, checkout, switch, or rebase,
                 and never moves the current branch onto the recovered commit. This recovery rule does
                 not apply to undoLastCommit, discard, status, diff, stage, or stash. Do not recover a
@@ -301,8 +303,9 @@ struct ModelBridge {
                 Do not invent a SHA or emit createBranchAt for a deleted-branch request without one.
                 'recover the commit abc1234' -> outcome ready, clarification "", exactly one
                 createBranchAt step with value "recovered/abc1234", sha "abc1234", paths [].
-                This abc1234 is part of the user request in the example, so use it; never treat a
-                SHA present in the actual user request as an example to avoid.
+                Never showReflog when the request already names a SHA. This abc1234 is part of the
+                user request in the example, so use it; never treat a SHA present in the actual
+                user request as an example to avoid.
                 'uncommit' -> outcome ready, clarification "", exactly one undoLastCommit step
                 with value "", paths [], and sha "".
                 'undo last commit', 'revert one commit back', 'I want to revert 1 commit back',
