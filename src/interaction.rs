@@ -2,20 +2,24 @@ use crate::{
     model::ClarificationTurn,
     plan::{Outcome, Plan, Proposal},
 };
-use std::io::{BufRead, Write};
+use std::{
+    io::{BufRead, Write},
+    path::Path,
+};
 
 type Error = Box<dyn std::error::Error>;
 
 /// Own the dialogue in Rust; no incomplete plan is returned to the renderer.
 pub fn clarify(
     mut translate: impl FnMut(&[ClarificationTurn]) -> Result<Proposal, Error>,
+    repository: &Path,
     input: &mut impl BufRead,
     prompts: &mut impl Write,
 ) -> Result<Option<Plan>, Error> {
     let mut history = Vec::new();
     let mut history_bytes = 0;
     loop {
-        let plan = translate(&history)?.validate()?;
+        let plan = translate(&history)?.validate(repository)?;
         match plan.outcome {
             Outcome::Ready => return Ok(Some(plan)),
             Outcome::Unsupported => {
@@ -96,7 +100,7 @@ fn read_answer(input: &mut impl BufRead) -> Result<Option<String>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::{io::Cursor, path::Path};
 
     fn proposal(outcome: Outcome) -> Proposal {
         serde_json::from_value(serde_json::json!({
@@ -122,6 +126,7 @@ mod tests {
                     Ok(proposal(Outcome::Ready))
                 }
             },
+            Path::new("."),
             &mut Cursor::new(b"unstaged\n"),
             &mut Vec::new(),
         )
@@ -139,6 +144,7 @@ mod tests {
                 assert_eq!(history.len(), calls - 1);
                 Ok(proposal(Outcome::NeedsClarification))
             },
+            Path::new("."),
             &mut Cursor::new(b"one\ntwo\nthree\nfour\n"),
             &mut Vec::new(),
         );
@@ -156,6 +162,7 @@ mod tests {
                         calls += 1;
                         Ok(proposal(Outcome::NeedsClarification))
                     },
+                    Path::new("."),
                     &mut Cursor::new(input),
                     &mut Vec::new()
                 )
@@ -168,6 +175,7 @@ mod tests {
         assert!(
             clarify(
                 |_| Ok(proposal(Outcome::Unsupported)),
+                Path::new("."),
                 &mut input,
                 &mut Vec::new()
             )
@@ -205,6 +213,7 @@ mod tests {
                 calls += 1;
                 Ok(proposal(Outcome::NeedsClarification))
             },
+            Path::new("."),
             &mut Cursor::new(b"invalid\tanswer\n"),
             &mut Vec::new(),
         );
@@ -220,6 +229,7 @@ mod tests {
                     Err("late inference failure".into())
                 }
             },
+            Path::new("."),
             &mut Cursor::new(b"unstaged\n"),
             &mut Vec::new(),
         );
@@ -237,6 +247,7 @@ mod tests {
         assert!(
             clarify(
                 |_| Err("inference failed".into()),
+                Path::new("."),
                 &mut Cursor::new(b""),
                 &mut Vec::new()
             )
@@ -249,6 +260,7 @@ mod tests {
                     p.clarification = "question".into();
                     Ok(p)
                 },
+                Path::new("."),
                 &mut Cursor::new(b""),
                 &mut Vec::new()
             )

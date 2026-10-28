@@ -774,7 +774,7 @@ mod tests {
         .unwrap();
         match response {
             super::Response::Plan { plan } => {
-                let validated = plan.validate().unwrap();
+                let validated = plan.validate(std::path::Path::new(".")).unwrap();
                 assert_eq!(
                     validated.commands[0].args,
                     ["status", "--short", "--branch"].map(str::to_owned)

@@ -59,7 +59,10 @@ deleted. Ctrl-C and SIGTERM trigger cleanup; SIGKILL, power loss, or machine
 shutdown cannot reliably run cleanup handlers.
 
 Assertions check structured outcomes, command scope, schema, and selected
-properties of drafted subjects. Passing them does not establish general model
+properties of drafted subjects. Recovery scenarios require reflog inspection
+for a lost commit, an undone reset, or a deleted branch, and require a named
+SHA to become a `recovered/<name>` branch or a clarification. Those plans must
+not emit `git reset`. Passing them does not establish general model
 quality, consistent behavior across repeated runs, resistance to all prompt
 injection, or the quality of a subject's wording. Review commit subjects for
 accuracy and clarity, and examine refusals and ambiguous requests on the Mac.
