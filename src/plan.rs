@@ -249,18 +249,8 @@ impl Proposal {
                 changes_repository: false,
             });
         }
-        // Models sometimes mark ready while also filling clarification. Empty
-        // steps mean they meant needsClarification; otherwise keep the plan and
-        // drop the stray clarification text.
         if !self.clarification.is_empty() {
-            if self.steps.is_empty() {
-                return Ok(state_plan(
-                    Outcome::NeedsClarification,
-                    self.summary.clone(),
-                    self.clarification.clone(),
-                ));
-            }
-            self.clarification.clear();
+            return Err(invalid("ready outcome cannot include clarification"));
         }
         self.steps = self.steps.into_iter().map(normalize_step_fields).collect();
         if self.steps.is_empty() || self.steps.len() > 6 {
@@ -914,6 +904,10 @@ mod tests {
             assert!(!plan.changes_repository);
         }
         let mut p = proposal(Action::Status, "", &[]);
+        p.clarification = "A question?".into();
+        assert!(p.validate(Path::new(".")).is_err());
+        let mut p = proposal(Action::Status, "", &[]);
+        p.steps.clear();
         p.clarification = "A question?".into();
         assert!(p.validate(Path::new(".")).is_err());
         let mut p = proposal(Action::Status, "", &[]);
