@@ -26,7 +26,12 @@ scenario passed; exit 1 means failure (130 for interruption).
 python3 evals/run.py --list
 python3 evals/run.py --case diff-staged --timeout 180
 python3 evals/run.py --artifacts eval-results/manual-run --keep-failures
+python3 evals/run.py --offline --binary target/debug/githelper
 ```
+
+`--offline` runs only scenarios marked `requires_model=False` (they fail before
+inference) and skips the Apple model preflight. It does not score model quality.
+Model-dependent scenarios stay on a supported Mac.
 
 Use the exact case names printed by `--list`; repeat `--case` to select several.
 `--timeout` sets the per-process timeout in seconds (default 120), including Git
@@ -54,7 +59,10 @@ deleted. Ctrl-C and SIGTERM trigger cleanup; SIGKILL, power loss, or machine
 shutdown cannot reliably run cleanup handlers.
 
 Assertions check structured outcomes, command scope, schema, and selected
-properties of drafted subjects. Passing them does not establish general model
+properties of drafted subjects. Recovery scenarios require reflog inspection
+for a lost commit, an undone reset, or a deleted branch, and require a named
+SHA to become a `recovered/<name>` branch or a clarification. Those plans must
+not emit `git reset`. Passing them does not establish general model
 quality, consistent behavior across repeated runs, resistance to all prompt
 injection, or the quality of a subject's wording. Review commit subjects for
 accuracy and clarity, and examine refusals and ambiguous requests on the Mac.
@@ -79,7 +87,10 @@ python3 -m unittest discover -s evals -p 'test_*.py'
 These standard-library tests use real temporary Git fixtures and mock only the
 githelper process boundary. They test cleanup, error reporting, mutation checks,
 Git configuration and hook isolation, interruption cleanup, and POSIX timeout
-cleanup. Run these tests locally; the evaluation harness and its preflight
-checks are excluded from CI.
+cleanup. CI runs these tests and `python3 evals/run.py --offline`. Scenarios
+that call Apple's model, and the doctor preflight in a full `run.py` invocation,
+stay on a supported Mac and are not part of CI.
 Their passing results are not model evaluation results. Normal
-`cargo test --locked` also does not run model evaluations.
+`cargo test --locked` also does not run model evaluations. The `fake-model`
+Cargo feature, covered separately by Rust tests, replays canned plans through
+validation and does not score Apple's model either.

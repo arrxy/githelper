@@ -14,4 +14,58 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo test --locked
+      - name: Eval harness without the Apple model
+        run: |
+          python3 evals/run.py --offline --binary target/debug/githelper --artifacts "${RUNNER_TEMP:-/tmp}/githelper-offline-evals"
+          python3 -m unittest discover -s evals -p 'test_*.py'
+      - run: cargo test --locked --features fake-model
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --all-targets --locked --features fake-model -- -D warnings
+      - name: Default release build has no fake model
+        run: |
+          cargo build --release --locked
+          python3 - <<'PY'
+          import os
+          import platform
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          binary = Path("target/release/githelper")
+          data = binary.read_bytes()
+          needle = b"GITHELPER_FAKE_MODEL"
+          if needle in data:
+              raise SystemExit(f"{binary} contains the fake model hook")
+          if platform.system() == "Darwin":
+              # Do not invoke the real Apple model. Absence of the hook string is
+              # enough on macOS; Linux also checks that the env var is ignored.
+              print(f"{binary} ({len(data)} bytes) has no fake model hook")
+              raise SystemExit(0)
+          sentinel = "FAKE_MODEL_SENTINEL_SHOULD_NOT_APPEAR"
+          fixture = (
+              '{"kind":"plan","plan":{"outcome":"ready","summary":"'
+              + sentinel
+              + '","clarification":"","steps":[{"action":"commit","value":"do not commit","paths":[]}]}}'
+          )
+          with tempfile.TemporaryDirectory() as temporary:
+              repo = Path(temporary) / "repo"
+              subprocess.run(["git", "init", "--initial-branch=main", str(repo)], check=True)
+              env = os.environ.copy()
+              env["GITHELPER_FAKE_MODEL"] = fixture
+              env["GIT_TERMINAL_PROMPT"] = "0"
+              result = subprocess.run(
+                  [str(binary), "--repo", str(repo), "--json", "commit everything"],
+                  env=env,
+                  capture_output=True,
+                  text=True,
+              )
+          if sentinel in result.stdout or sentinel in result.stderr:
+              raise SystemExit(f"release binary honored the fake model:\n{result.stdout}\n{result.stderr}")
+          if result.returncode == 0 or result.stdout.strip():
+              raise SystemExit(
+                  f"release binary printed a plan without the Apple model:\n{result.stdout}\n{result.stderr}"
+              )
+          if "macOS 26" not in result.stderr:
+              raise SystemExit(f"expected the macOS setup error, got:\n{result.stderr}")
+          print(f"{binary} ({len(data)} bytes) ignores GITHELPER_FAKE_MODEL")
+          PY

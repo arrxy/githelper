@@ -1,8 +1,10 @@
 mod commit_message;
+mod doctor;
 mod interaction;
 mod model;
 mod plan;
 mod repository;
+mod setup_text;
 
 use clap::Parser;
 use std::{
@@ -14,7 +16,7 @@ use std::{
 #[command(
     version,
     about = "Plain language → Git commands, using Apple's on-device model.",
-    after_help = "Examples:\n  githelper \"show my staged changes\"\n  githelper --repo ~/code/app \"create a branch called fix/login\"\n  githelper --json \"stage README.md and commit with message update docs\"\n  githelper --doctor\n  githelper --interactive \"commit my changes\"\n  githelper --draft-commit --json\n\nCommands are printed for review. Nothing is executed."
+    after_help = "Examples:\n  githelper \"show my staged changes\"\n  githelper --repo ~/code/app \"create a branch called fix/login\"\n  githelper --json \"stage README.md and commit with message update docs\"\n  githelper \"undo my last commit\"\n  githelper \"discard changes to README.md\"\n  githelper --doctor\n  githelper --interactive \"commit my changes\"\n  githelper --draft-commit --json\n  githelper \"I lost a commit\"\n\nCommands are printed for review. Nothing is executed."
 )]
 struct Cli {
     /// Request in plain language (quotes recommended)
@@ -25,7 +27,7 @@ struct Cli {
     /// Print structured JSON, including command argument arrays
     #[arg(long)]
     json: bool,
-    /// Check whether Apple's on-device model is available
+    /// Check macOS, Xcode, Apple Intelligence, Git, and the current repository
     #[arg(long, conflicts_with = "request")]
     doctor: bool,
     /// Ask up to three clarification questions using terminal input
@@ -47,14 +49,14 @@ fn main() {
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let bridge = model::AppleModel;
     if cli.doctor {
-        let status = bridge.status()?;
+        let report = doctor::diagnose(&cli.repo);
         if cli.json {
-            println!("{}", serde_json::to_string_pretty(&status)?);
+            println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
-            println!("{}", status.detail);
+            print!("{}", doctor::render_text(&report));
         }
-        if !status.available {
-            return Err("on-device model unavailable".into());
+        if !report.ok {
+            return Err(report.failure_summary().into());
         }
         return Ok(());
     }
@@ -75,17 +77,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err("request must be at most 4,000 bytes and contain no control characters".into());
     }
     let context = repository::inspect(&cli.repo)?;
+    let repository = PathBuf::from(&context.root);
     let plan = if cli.interactive {
         let result = interaction::clarify(
             |history| bridge.translate(&request, &context, history),
+            &repository,
             &mut io::stdin().lock(),
             &mut io::stderr().lock(),
         )?;
         let Some(plan) = result else { return Ok(()) };
         plan
     } else {
-        bridge.translate(&request, &context, &[])?.validate()?
+        bridge
+            .translate(&request, &context, &[])?
+            .validate(&repository)?
     };
+    let plan = plan::validate_repository(plan, std::path::Path::new(&context.root))?;
     render_plan(&mut io::stdout().lock(), &plan, &context.root, cli.json)?;
     Ok(())
 }
@@ -122,6 +129,9 @@ fn render_plan(
         writeln!(output, "{}\n", plan.summary)?;
         for command in &plan.commands {
             writeln!(output, "{}", command.explanation)?;
+            if let Some(warning) = command.warning {
+                writeln!(output, "  Warning: {warning}")?;
+            }
             writeln!(output, "  {}", command.display())?;
         }
         writeln!(
@@ -150,7 +160,7 @@ mod tests {
             "steps":[{"action":"diff","value":"","paths":[]}]
         }))
         .unwrap();
-        let plan = proposal.validate().unwrap();
+        let plan = proposal.validate(std::path::Path::new(".")).unwrap();
         let mut output = Vec::new();
         render_plan(&mut output, &plan, "/repo", false).unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -159,12 +169,77 @@ mod tests {
             plan.commands[0].explanation,
             plan.commands[0].display()
         )));
+        assert!(!text.contains("Warning:"));
         let mut output = Vec::new();
         render_plan(&mut output, &plan, "/repo", true).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(
             json["commands"][0]["explanation"],
             plan.commands[0].explanation
+        );
+        assert!(json["commands"][0].get("destructive").is_none());
+        assert!(json["commands"][0].get("warning").is_none());
+    }
+
+    #[test]
+    fn destructive_step_shows_warning_in_text_and_json() {
+        let plan = plan::Plan {
+            outcome: plan::Outcome::Ready,
+            summary: "Discard local edits".into(),
+            clarification: None,
+            commands: vec![
+                plan::GitCommand {
+                    program: "git",
+                    explanation: "Discards uncommitted changes in the working tree.".into(),
+                    args: vec![
+                        "restore".into(),
+                        "--worktree".into(),
+                        "--".into(),
+                        ".".into(),
+                    ],
+                    destructive: true,
+                    warning: Some("This permanently discards uncommitted work."),
+                },
+                plan::GitCommand {
+                    program: "git",
+                    explanation: "Shows short repository status and the current branch.".into(),
+                    args: vec!["status".into(), "--short".into(), "--branch".into()],
+                    destructive: false,
+                    warning: None,
+                },
+            ],
+            changes_repository: true,
+        };
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\
+Discard local edits
+
+Discards uncommitted changes in the working tree.
+  Warning: This permanently discards uncommitted work.
+  git restore --worktree -- .
+Shows short repository status and the current branch.
+  git status --short --branch
+
+Review these commands before running them in /repo.
+This plan changes repository state or contacts a remote.
+"
+        );
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["commands"][0]["destructive"], true);
+        assert_eq!(
+            json["commands"][0]["warning"],
+            "This permanently discards uncommitted work."
+        );
+        assert!(json["commands"][1].get("destructive").is_none());
+        assert!(json["commands"][1].get("warning").is_none());
+        assert_eq!(
+            json["commands"][1]["args"],
+            serde_json::json!(["status", "--short", "--branch"])
         );
     }
 
@@ -180,5 +255,119 @@ mod tests {
         let mut output = Vec::new();
         render_commit(&mut output, "Fix login", false).unwrap();
         assert_eq!(output, b"Fix login\n");
+    }
+
+    #[test]
+    fn recovery_reflog_renders_inspection_without_reset_or_warning() {
+        let proposal: plan::Proposal = serde_json::from_value(serde_json::json!({
+            "outcome": "ready",
+            "summary": "Recover the lost commit without moving the current branch.",
+            "clarification": "",
+            "steps": [{"action": "showReflog", "value": "", "paths": []}]
+        }))
+        .unwrap();
+        let plan = proposal.validate(std::path::Path::new(".")).unwrap();
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\
+Recover the lost commit without moving the current branch.
+
+Shows the 20 most recent reflog entries. Find the lost commit or deleted branch in that list and note its SHA, then ask to recover that SHA.
+  git reflog -n 20
+
+Review these commands before running them in /repo.
+"
+        );
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(
+            json["commands"][0]["args"],
+            serde_json::json!(["reflog", "-n", "20"])
+        );
+        assert!(json["commands"][0].get("destructive").is_none());
+        assert!(json["commands"][0].get("warning").is_none());
+        assert_eq!(json["changes_repository"], false);
+        assert!(!json.to_string().contains("reset"));
+    }
+
+    #[test]
+    fn missing_commit_recovery_renders_clarification_without_commands() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .arg(directory.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let proposal: plan::Proposal = serde_json::from_value(serde_json::json!({
+            "outcome": "ready",
+            "summary": "Recover the lost commit",
+            "clarification": "",
+            "steps": [{
+                "action": "createBranchAt",
+                "value": "login",
+                "paths": [],
+                "sha": "abc1234"
+            }]
+        }))
+        .unwrap();
+        let plan = proposal.validate(directory.path()).unwrap();
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(
+            text,
+            "Clarification needed: Commit abc1234 does not resolve to an existing commit. Which commit SHA should be recovered? Use `git reflog -n 20` to find it.\n"
+        );
+        assert!(!text.contains("reset"));
+        assert!(!text.contains("Review these commands"));
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["outcome"], "needsClarification");
+        assert_eq!(json["commands"], serde_json::json!([]));
+        assert_eq!(json["changes_repository"], false);
+        assert!(json.get("destructive").is_none());
+        assert!(!json.to_string().contains("reset"));
+        let listed = std::process::Command::new("git")
+            .args(["for-each-ref", "refs/heads"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert!(listed.stdout.is_empty());
+    }
+
+    #[test]
+    fn discard_plan_renders_permanent_loss_warning() {
+        let proposal: plan::Proposal = serde_json::from_value(serde_json::json!({
+            "outcome": "ready",
+            "summary": "Discard README edits",
+            "clarification": "",
+            "steps": [{"action": "discard", "value": "", "paths": ["README.md"]}]
+        }))
+        .unwrap();
+        let plan = proposal.validate(std::path::Path::new(".")).unwrap();
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", false).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("lost permanently"));
+        assert!(text.contains("Warning: "));
+        assert!(text.contains("git --literal-pathspecs restore -- README.md"));
+        let mut output = Vec::new();
+        render_plan(&mut output, &plan, "/repo", true).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(json["commands"][0]["destructive"], true);
+        assert!(
+            json["commands"][0]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("lost permanently")
+        );
     }
 }
