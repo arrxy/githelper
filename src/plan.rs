@@ -234,9 +234,13 @@ fn path_mentioned(text: &str, path: &str) -> bool {
 
     text.match_indices(path).any(|(start, _)| {
         let before = text[..start].chars().next_back();
-        let after = text[start + path.len()..].chars().next();
+        let rest = &text[start + path.len()..];
+        // Sentence punctuation right after a path ("discard README.md.") is a
+        // boundary, not part of the path.
+        let rest = rest.trim_start_matches(['.', ',', '!', '?']);
+        let after = rest.chars().next();
         before.is_none_or(|character| !path_character(character))
-            && after.is_none_or(|character| !path_character(character))
+            && after.is_none_or(|character| character.is_whitespace() || !path_character(character))
     })
 }
 
@@ -974,6 +978,16 @@ mod tests {
                 sha: String::new(),
             }],
         }
+    }
+
+    #[test]
+    fn trailing_sentence_punctuation_is_a_path_boundary() {
+        assert!(path_mentioned("discard README.md.", "README.md"));
+        assert!(path_mentioned("discard README.md, please", "README.md"));
+        assert!(path_mentioned("stage README.md!", "README.md"));
+        assert!(path_mentioned("unstage README.md?", "README.md"));
+        assert!(!path_mentioned("discard README.md.bak", "README.md"));
+        assert!(!path_mentioned("discard README.mdx", "README.md"));
     }
 
     #[test]
