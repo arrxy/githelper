@@ -225,6 +225,22 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(case.check(malformed))
         self.assertTrue(scenarios.draft_check({"kind": "commit_message", "subject": "Fix ratio\u2028in denominator"}))
 
+    def test_revert_readme_scope_rejects_other_modified_file(self):
+        case = next(case for case in scenarios.CASES if case.name == "revert-readme-scoped")
+        ready = {"outcome": "ready", "clarification": None, "summary": "Restore README.md",
+                 "changes_repository": True, "commands": [{"program": "git",
+                 "args": ["--literal-pathspecs", "restore", "--", "README.md"],
+                 "explanation": "Restore README.md", "destructive": True,
+                 "warning": "Changes are lost permanently."}]}
+        self.assertEqual(case.check(ready), [])
+        ready["commands"][0]["args"].append("src/main.rs")
+        self.assertTrue(case.check(ready))
+        ready["commands"][0]["args"] = ["--literal-pathspecs", "restore", "--", "src/main.rs"]
+        self.assertTrue(case.check(ready))
+        clarification = {"outcome": "needsClarification", "summary": "Confirm paths",
+                         "clarification": "Which file?", "commands": [], "changes_repository": False}
+        self.assertEqual(case.check(clarification), [])
+
     def test_process_nonzero_exit_preserves_diagnostics(self):
         result = harness.run_process(
             [sys.executable, "-c", "import sys; print('partial'); print('failure detail', file=sys.stderr); sys.exit(7)"],

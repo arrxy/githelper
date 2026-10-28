@@ -635,7 +635,8 @@ mod plan_path {
 
         for case in cases {
             let fixture = ready(case.action, case.value, case.paths);
-            let text = workspace.run(&fixture, &["perform the canned plan"]);
+            let request = format!("perform the canned plan {}", case.paths.join(" "));
+            let text = workspace.run(&fixture, &[&request]);
             assert!(
                 text.status.success(),
                 "{:?} stderr {}",
@@ -668,7 +669,7 @@ mod plan_path {
             assert_eq!(text, expected, "{}", case.action);
             assert_eq!(case.warning.is_some(), text.contains("Warning:"));
 
-            let json_output = workspace.run(&fixture, &["--json", "perform the canned plan"]);
+            let json_output = workspace.run(&fixture, &["--json", &request]);
             assert!(
                 json_output.status.success(),
                 "{}",
@@ -713,7 +714,7 @@ mod plan_path {
                 {"action": "commit", "value": "Update documentation", "paths": []}
             ]),
         );
-        let output = workspace.run(&fixture, &["--json", "stage README and commit"]);
+        let output = workspace.run(&fixture, &["--json", "stage README.md and commit"]);
         assert!(
             output.status.success(),
             "{}",
@@ -733,7 +734,7 @@ mod plan_path {
         assert_eq!(json["changes_repository"], true);
         assert!(json["commands"][0].get("destructive").is_none());
         assert!(json["commands"][1].get("warning").is_none());
-        let text = workspace.run(&fixture, &["stage README and commit"]);
+        let text = workspace.run(&fixture, &["stage README.md and commit"]);
         assert!(
             text.status.success(),
             "{}",
@@ -748,6 +749,37 @@ mod plan_path {
         assert!(text.contains("git --literal-pathspecs add -- README.md"));
         assert!(text.contains("git commit -m 'Update documentation'"));
         assert!(!text.contains("Warning:"));
+        workspace.assert_only_inspected();
+        workspace.assert_unchanged();
+    }
+
+    #[cfg(feature = "fake-model")]
+    #[test]
+    fn unrequested_discard_path_prints_only_clarification() {
+        let workspace = Workspace::new();
+        let fixture = model_plan(
+            "Restore requested changes",
+            "ready",
+            "",
+            serde_json::json!([{
+                "action": "discard",
+                "value": "",
+                "paths": ["README.md", "src/main.rs"]
+            }]),
+        );
+        let request = "revert my changes to README.md";
+        let text = workspace.run(&fixture, &[request]);
+        assert!(text.status.success());
+        assert_eq!(
+            String::from_utf8(text.stdout).unwrap(),
+            "Clarification needed: Which exact file paths should be changed? Name each file explicitly.\n"
+        );
+        let json_output = workspace.run(&fixture, &["--json", request]);
+        assert!(json_output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+        assert_eq!(json["outcome"], "needsClarification");
+        assert_eq!(json["commands"], serde_json::json!([]));
+        assert_eq!(json["changes_repository"], false);
         workspace.assert_only_inspected();
         workspace.assert_unchanged();
     }

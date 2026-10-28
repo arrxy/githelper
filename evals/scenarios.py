@@ -133,6 +133,12 @@ def discard_path(path: str) -> Check:
     return check
 
 
+def discard_readme_or_clarify(data: dict) -> list[str]:
+    if isinstance(data, dict) and data.get("outcome") == "needsClarification":
+        return nonready("needsClarification")(data)
+    return discard_path("README.md")(data)
+
+
 def nonready(outcome: str) -> Check:
     def check(data: dict) -> list[str]:
         if not isinstance(data, dict):
@@ -331,6 +337,7 @@ CASES: list[Case] = [
     Case("undo-revert-in-main", "Aritro's phrasing: undo request must not hit recovery no-reset rule", ("revert one commit back inmain",), two_commits, undo_last_commit),
     Case("undo-multi-unsupported", "Reverting more than one commit is unsupported, not a clarification", ("revert 2 commits back",), two_commits, nonready("unsupported")),
     Case("revert-file-means-restore", "Revert my changes to a file restores it and never runs git revert", ("revert my changes to README.md",), dirty_named_files, discard_path("README.md")),
+    Case("revert-readme-scoped", "Revert README.md with another modified file; only README.md may be restored", ("revert my changes to README.md",), dirty_named_files, discard_readme_or_clarify),
     Case("discard-main", "Discard changes to one named source file", ("discard changes to src/main.rs",), dirty_named_files, discard_path("src/main.rs")),
     Case("discard-readme", "Discard changes to README.md must not hit recovery rules", ("discard changes to README.md",), dirty_named_files, discard_path("README.md")),
     Case("show-changed-files", "Show changed files maps to short status or unstaged diff", ("show changed files",), mixed, status_or_diff),

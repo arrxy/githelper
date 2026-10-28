@@ -1,3 +1,4 @@
+use crate::model::ClarificationTurn;
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
@@ -226,20 +227,40 @@ fn text(value: &str, maximum: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
+fn path_mentioned(text: &str, path: &str) -> bool {
+    fn path_character(character: char) -> bool {
+        character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | '\\')
+    }
+
+    text.match_indices(path).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let after = text[start + path.len()..].chars().next();
+        before.is_none_or(|character| !path_character(character))
+            && after.is_none_or(|character| !path_character(character))
+    })
+}
+
 impl Proposal {
     /// Like [`Self::validate`], but when validation fails and
     /// `GITHELPER_DUMP_PROPOSAL` is set, writes the raw proposal JSON to that
     /// path for eval/debug inspection. Normal CLI output is unchanged.
-    pub fn validate_dumping_on_failure(self, repository: &Path) -> Result<Plan, InvalidPlan> {
+    pub fn validate_dumping_on_failure(
+        self,
+        repository: &Path,
+        request: &str,
+        history: &[ClarificationTurn],
+    ) -> Result<Plan, InvalidPlan> {
         let dump_path = std::env::var_os("GITHELPER_DUMP_PROPOSAL")
             .filter(|path| !path.is_empty())
             .map(std::path::PathBuf::from);
-        self.validate_writing_dump_on_failure(repository, dump_path.as_deref())
+        self.validate_writing_dump_on_failure(repository, request, history, dump_path.as_deref())
     }
 
     fn validate_writing_dump_on_failure(
         self,
         repository: &Path,
+        request: &str,
+        history: &[ClarificationTurn],
         dump_path: Option<&Path>,
     ) -> Result<Plan, InvalidPlan> {
         // Serialize before consume so a failed proposal can still be dumped.
@@ -248,7 +269,7 @@ impl Proposal {
                 .ok()
                 .map(|bytes| (path.to_path_buf(), bytes))
         });
-        match self.validate(repository) {
+        match self.validate_for_request(repository, request, history) {
             Ok(plan) => Ok(plan),
             Err(err) => {
                 if let Some((path, bytes)) = dump {
@@ -257,6 +278,45 @@ impl Proposal {
                 Err(err)
             }
         }
+    }
+
+    /// A named file may only come from text the user actually typed. Check the
+    /// normalized steps because the model sometimes puts a stage path in `value`.
+    pub fn validate_for_request(
+        self,
+        repository: &Path,
+        request: &str,
+        history: &[ClarificationTurn],
+    ) -> Result<Plan, InvalidPlan> {
+        let steps: Vec<_> = self
+            .steps
+            .iter()
+            .cloned()
+            .map(normalize_step_fields)
+            .collect();
+        let plan = self.validate(repository)?;
+        if plan.outcome != Outcome::Ready {
+            return Ok(plan);
+        }
+        let unmentioned = steps.iter().any(|step| {
+            matches!(
+                step.action,
+                Action::Discard | Action::Stage | Action::Unstage
+            ) && step.paths.iter().any(|path| {
+                !path_mentioned(request, path)
+                    && !history
+                        .iter()
+                        .any(|turn| path_mentioned(&turn.answer, path))
+            })
+        });
+        if unmentioned {
+            return Ok(state_plan(
+                Outcome::NeedsClarification,
+                plan.summary,
+                "Which exact file paths should be changed? Name each file explicitly.",
+            ));
+        }
+        Ok(plan)
     }
 
     pub fn validate(mut self, repository: &Path) -> Result<Plan, InvalidPlan> {
@@ -917,6 +977,76 @@ mod tests {
     }
 
     #[test]
+    fn named_paths_must_appear_in_user_text() {
+        let request = "revert my changes to README.md";
+        let rejected = proposal(Action::Discard, "", &["README.md", "src/main.rs"])
+            .validate_for_request(Path::new("."), request, &[])
+            .unwrap();
+        assert_eq!(rejected.outcome, Outcome::NeedsClarification);
+        assert!(rejected.commands.is_empty());
+        assert!(!rejected.changes_repository);
+
+        let accepted = proposal(Action::Discard, "", &["README.md"])
+            .validate_for_request(Path::new("."), request, &[])
+            .unwrap();
+        assert_eq!(accepted.outcome, Outcome::Ready);
+        assert_eq!(
+            accepted.commands[0].args,
+            strings(&["--literal-pathspecs", "restore", "--", "README.md"])
+        );
+
+        for (action, request) in [
+            (Action::Stage, "stage README.md"),
+            (Action::Unstage, "unstage README.md"),
+        ] {
+            let rejected = proposal(action, "", &["src/main.rs"])
+                .validate_for_request(Path::new("."), request, &[])
+                .unwrap();
+            assert_eq!(rejected.outcome, Outcome::NeedsClarification);
+            assert!(rejected.commands.is_empty());
+        }
+
+        let stage_all = proposal(Action::StageAll, "", &[])
+            .validate_for_request(Path::new("."), "stage all changes", &[])
+            .unwrap();
+        assert_eq!(stage_all.outcome, Outcome::Ready);
+        assert_eq!(stage_all.commands[0].args, strings(&["add", "--all"]));
+    }
+
+    #[test]
+    fn path_scope_uses_typed_answers_and_normalized_steps() {
+        let history = [ClarificationTurn {
+            question: "Which file?".into(),
+            answer: "src/main.rs".into(),
+        }];
+        let accepted = proposal(Action::Unstage, "", &["src/main.rs"])
+            .validate_for_request(Path::new("."), "unstage a file", &history)
+            .unwrap();
+        assert_eq!(accepted.outcome, Outcome::Ready);
+
+        let answer_only_in_question = [ClarificationTurn {
+            question: "Did you mean src/main.rs?".into(),
+            answer: "yes".into(),
+        }];
+        let rejected = proposal(Action::Discard, "", &["src/main.rs"])
+            .validate_for_request(
+                Path::new("."),
+                "revert my changes",
+                &answer_only_in_question,
+            )
+            .unwrap();
+        assert_eq!(rejected.outcome, Outcome::NeedsClarification);
+
+        let misfiled = proposal(Action::Stage, "src/main.rs", &[])
+            .validate_for_request(Path::new("."), "stage README.md", &[])
+            .unwrap();
+        assert_eq!(misfiled.outcome, Outcome::NeedsClarification);
+        assert!(!path_mentioned("README.md.backup", "README.md"));
+        assert!(!path_mentioned("readme.md", "README.md"));
+        assert!(path_mentioned("stage 'README.md', please", "README.md"));
+    }
+
+    #[test]
     fn every_action_has_a_scope_specific_explanation_and_preserves_order() {
         use Action::*;
         let cases = [
@@ -1134,7 +1264,7 @@ mod tests {
             }],
         };
         let err = bad
-            .validate_writing_dump_on_failure(Path::new("."), Some(&path))
+            .validate_writing_dump_on_failure(Path::new("."), "stage README.md", &[], Some(&path))
             .expect_err("escape path must fail validation");
         assert!(
             err.to_string()
@@ -1146,13 +1276,13 @@ mod tests {
         // Successful validation must not write the dump file.
         let ok_path = dir.path().join("should-not-exist.json");
         proposal(Action::Stage, "", &[":(glob)*"])
-            .validate_writing_dump_on_failure(Path::new("."), Some(&ok_path))
+            .validate_writing_dump_on_failure(Path::new("."), "stage :(glob)*", &[], Some(&ok_path))
             .expect("literal pathspec filename is valid");
         assert!(!ok_path.exists(), "success must not create dump");
         // No dump path: failure still returns the same error and writes nothing.
         let missing = dir.path().join("never.json");
         let err = proposal(Action::Stage, "", &["../secret"])
-            .validate_writing_dump_on_failure(Path::new("."), None)
+            .validate_writing_dump_on_failure(Path::new("."), "stage ../secret", &[], None)
             .expect_err("escape path must fail");
         assert!(
             err.to_string()

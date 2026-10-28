@@ -108,6 +108,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Ok(plan::rewrite_named_sha_recovery(&request, proposal))
             },
             &repository,
+            &request,
             &mut io::stdin().lock(),
             &mut io::stderr().lock(),
         )?;
@@ -119,7 +120,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         timing("model_call_ms", model_started);
         let proposal = plan::rewrite_named_sha_recovery(&request, proposal);
         let validate_started = Instant::now();
-        let plan = proposal.validate_dumping_on_failure(&repository)?;
+        let plan = proposal.validate_dumping_on_failure(&repository, &request, &[])?;
         timing("plan_validation_ms", validate_started);
         plan
     };
