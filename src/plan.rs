@@ -8,6 +8,9 @@ use thiserror::Error;
 
 const DISCARD_WARNING: &str = "Uncommitted changes to this file are lost permanently.";
 const PUBLISHED_UNDO_WARNING: &str = "This commit is already on the upstream. Rewriting it needs a force push, which githelper does not support.";
+const RESET_TARGET_REASON: &str = "Resetting to a commit or another branch isn't supported because it can throw away work. githelper can only undo your latest commit.";
+const HARD_RESET_REASON: &str =
+    "Hard reset isn't supported because it permanently deletes uncommitted work.";
 
 /// Closed set of operations the model may select.
 ///
@@ -244,6 +247,37 @@ fn path_mentioned(text: &str, path: &str) -> bool {
     })
 }
 
+fn unsupported_reset_reason(request: &str) -> Option<&'static str> {
+    let words: Vec<_> = request
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                matches!(character, '.' | ',' | '!' | '?' | '"' | '\'')
+            })
+            .to_ascii_lowercase()
+        })
+        .collect();
+    let reset = words.iter().position(|word| word == "reset")?;
+    let rest = &words[reset + 1..];
+    if rest.iter().any(|word| word == "hard" || word == "--hard") {
+        return Some(HARD_RESET_REASON);
+    }
+    if let Some(to) = rest.iter().position(|word| word == "to") {
+        let target = rest
+            .get(to + 1..)?
+            .iter()
+            .find(|word| word.as_str() != "the")?;
+        if target != "head~1" {
+            return Some(RESET_TARGET_REASON);
+        }
+    }
+    let first = rest.iter().find(|word| !word.starts_with('-'))?;
+    if matches!(first.as_str(), "my" | "last" | "changes" | "head~1" | "to") {
+        return None;
+    }
+    Some(RESET_TARGET_REASON)
+}
+
 impl Proposal {
     /// Like [`Self::validate`], but when validation fails and
     /// `GITHELPER_DUMP_PROPOSAL` is set, writes the raw proposal JSON to that
@@ -292,6 +326,17 @@ impl Proposal {
         request: &str,
         history: &[ClarificationTurn],
     ) -> Result<Plan, InvalidPlan> {
+        let reset_request = request.trim().trim_end_matches(['.', '!', '?']);
+        if reset_request.eq_ignore_ascii_case("reset my changes") && history.is_empty() {
+            return Ok(state_plan(
+                Outcome::NeedsClarification,
+                self.summary,
+                "Do you want to unstage your changes or discard them?",
+            ));
+        }
+        if let Some(reason) = unsupported_reset_reason(reset_request) {
+            return Ok(state_plan(Outcome::Unsupported, reason.into(), reason));
+        }
         let steps: Vec<_> = self
             .steps
             .iter()
@@ -1025,6 +1070,72 @@ mod tests {
             .unwrap();
         assert_eq!(stage_all.outcome, Outcome::Ready);
         assert_eq!(stage_all.commands[0].args, strings(&["add", "--all"]));
+    }
+
+    #[test]
+    fn reset_request_refusals_have_specific_reasons_and_no_commands() {
+        for request in [
+            "reset to origin/main",
+            "reset to upstream/dev",
+            "reset to main",
+            "reset to abc1234",
+            "git reset --soft feature/topic",
+        ] {
+            let plan = proposal(Action::UndoLastCommit, "", &[])
+                .validate_for_request(Path::new("."), request, &[])
+                .unwrap();
+            assert_eq!(plan.outcome, Outcome::Unsupported, "{request}");
+            assert_eq!(plan.clarification.as_deref(), Some(RESET_TARGET_REASON));
+            assert!(plan.commands.is_empty(), "{request}");
+            assert!(!plan.changes_repository, "{request}");
+            assert!(!serde_json::to_string(&plan).unwrap().contains("force push"));
+        }
+
+        let mut misleading = proposal(Action::UndoLastCommit, "", &[]);
+        misleading.summary = "This needs a force push".into();
+        let origin = misleading
+            .validate_for_request(Path::new("."), "reset to origin/main", &[])
+            .unwrap();
+        assert_eq!(origin.summary, RESET_TARGET_REASON);
+        assert!(
+            !serde_json::to_string(&origin)
+                .unwrap()
+                .contains("force push")
+        );
+
+        let hard = proposal(Action::UndoLastCommit, "", &[])
+            .validate_for_request(Path::new("."), "reset hard to the last commit", &[])
+            .unwrap();
+        assert_eq!(hard.outcome, Outcome::Unsupported);
+        assert_eq!(hard.clarification.as_deref(), Some(HARD_RESET_REASON));
+        assert!(hard.commands.is_empty());
+        assert!(!hard.changes_repository);
+
+        let ambiguous = proposal(Action::UndoLastCommit, "", &[])
+            .validate_for_request(Path::new("."), "reset my changes", &[])
+            .unwrap();
+        assert_eq!(ambiguous.outcome, Outcome::NeedsClarification);
+        assert_eq!(
+            ambiguous.clarification.as_deref(),
+            Some("Do you want to unstage your changes or discard them?")
+        );
+        assert!(ambiguous.commands.is_empty());
+
+        for request in [
+            "reset my last commit",
+            "git reset HEAD~1",
+            "git reset --soft HEAD~1",
+        ] {
+            let plan = proposal(Action::UndoLastCommit, "", &[])
+                .validate_for_request(Path::new("."), request, &[])
+                .unwrap();
+            assert_eq!(plan.outcome, Outcome::Ready, "{request}");
+            assert_eq!(plan.commands.len(), 1);
+            assert_eq!(
+                plan.commands[0].args,
+                strings(&["reset", "--soft", "HEAD~1"])
+            );
+        }
     }
 
     #[test]
