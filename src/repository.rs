@@ -50,7 +50,16 @@ pub fn inspect(directory: &Path) -> Result<Context, Box<dyn std::error::Error>> 
         &["status", "--porcelain=v1", "--untracked-files=no"],
     )?;
     // Keep context small enough for the on-device model. No file contents or diffs are read.
-    let tracked_status: String = status.chars().take(4_000).collect();
+    // An empty porcelain listing means a clean tracked worktree. Send an explicit marker so
+    // the model does not treat a missing/blank field as "context unavailable".
+    let tracked_status: String = {
+        let clipped: String = status.chars().take(4_000).collect();
+        if clipped.trim().is_empty() {
+            "(clean: no modified tracked files)".into()
+        } else {
+            clipped
+        }
+    };
     Ok(Context {
         root,
         current_branch: if current_branch.is_empty() {
@@ -88,7 +97,7 @@ mod tests {
         );
         assert_eq!(context.current_branch, "main");
         assert!(context.local_branches.is_empty());
-        assert!(context.tracked_status.is_empty());
+        assert_eq!(context.tracked_status, "(clean: no modified tracked files)");
     }
 
     #[test]

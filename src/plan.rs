@@ -1,3 +1,4 @@
+use crate::model::ClarificationTurn;
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
@@ -179,7 +180,7 @@ impl From<&Action> for WireAction {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Proposal {
     pub outcome: Outcome,
@@ -226,12 +227,116 @@ fn text(value: &str, maximum: usize) -> bool {
     !value.trim().is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
 }
 
+fn path_mentioned(text: &str, path: &str) -> bool {
+    fn path_character(character: char) -> bool {
+        character.is_alphanumeric() || matches!(character, '_' | '-' | '.' | '/' | '\\')
+    }
+
+    text.match_indices(path).any(|(start, _)| {
+        let before = text[..start].chars().next_back();
+        let rest = &text[start + path.len()..];
+        // Sentence punctuation right after a path ("discard README.md.") is a
+        // boundary, not part of the path.
+        let rest = rest.trim_start_matches(['.', ',', '!', '?']);
+        let after = rest.chars().next();
+        before.is_none_or(|character| !path_character(character))
+            && after.is_none_or(|character| character.is_whitespace() || !path_character(character))
+    })
+}
+
 impl Proposal {
-    pub fn validate(self, repository: &Path) -> Result<Plan, InvalidPlan> {
+    /// Like [`Self::validate`], but when validation fails and
+    /// `GITHELPER_DUMP_PROPOSAL` is set, writes the raw proposal JSON to that
+    /// path for eval/debug inspection. Normal CLI output is unchanged.
+    pub fn validate_dumping_on_failure(
+        self,
+        repository: &Path,
+        request: &str,
+        history: &[ClarificationTurn],
+    ) -> Result<Plan, InvalidPlan> {
+        let dump_path = std::env::var_os("GITHELPER_DUMP_PROPOSAL")
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from);
+        self.validate_writing_dump_on_failure(repository, request, history, dump_path.as_deref())
+    }
+
+    fn validate_writing_dump_on_failure(
+        self,
+        repository: &Path,
+        request: &str,
+        history: &[ClarificationTurn],
+        dump_path: Option<&Path>,
+    ) -> Result<Plan, InvalidPlan> {
+        // Serialize before consume so a failed proposal can still be dumped.
+        let dump = dump_path.and_then(|path| {
+            serde_json::to_vec_pretty(&self)
+                .ok()
+                .map(|bytes| (path.to_path_buf(), bytes))
+        });
+        match self.validate_for_request(repository, request, history) {
+            Ok(plan) => Ok(plan),
+            Err(err) => {
+                if let Some((path, bytes)) = dump {
+                    let _ = std::fs::write(path, bytes);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// A named file may only come from text the user actually typed. Check the
+    /// normalized steps because the model sometimes puts a stage path in `value`.
+    pub fn validate_for_request(
+        self,
+        repository: &Path,
+        request: &str,
+        history: &[ClarificationTurn],
+    ) -> Result<Plan, InvalidPlan> {
+        let steps: Vec<_> = self
+            .steps
+            .iter()
+            .cloned()
+            .map(normalize_step_fields)
+            .collect();
+        let plan = self.validate(repository)?;
+        if plan.outcome != Outcome::Ready {
+            return Ok(plan);
+        }
+        let unmentioned = steps.iter().any(|step| {
+            matches!(
+                step.action,
+                Action::Discard | Action::Stage | Action::Unstage
+            ) && step.paths.iter().any(|path| {
+                !path_mentioned(request, path)
+                    && !history
+                        .iter()
+                        .any(|turn| path_mentioned(&turn.answer, path))
+            })
+        });
+        if unmentioned {
+            return Ok(state_plan(
+                Outcome::NeedsClarification,
+                plan.summary,
+                "Which exact file paths should be changed? Name each file explicitly.",
+            ));
+        }
+        Ok(plan)
+    }
+
+    pub fn validate(mut self, repository: &Path) -> Result<Plan, InvalidPlan> {
         if !text(&self.summary, 1_000) {
             return Err(invalid("missing or invalid summary"));
         }
         if self.outcome != Outcome::Ready {
+            // Unsupported refusals sometimes still include leftover steps from the
+            // on-device model. Drop them. NeedsClarification with steps still fails
+            // closed so a clarification cannot hide commands.
+            if self.outcome == Outcome::Unsupported {
+                self.steps.clear();
+                if self.clarification.trim().is_empty() {
+                    self.clarification = self.summary.clone();
+                }
+            }
             if !text(&self.clarification, 1_000) || !self.steps.is_empty() {
                 return Err(invalid("clarification must have no commands"));
             }
@@ -244,8 +349,9 @@ impl Proposal {
             });
         }
         if !self.clarification.is_empty() {
-            return Err(invalid("ready plans must not request clarification"));
+            return Err(invalid("ready outcome cannot include clarification"));
         }
+        self.steps = self.steps.into_iter().map(normalize_step_fields).collect();
         if self.steps.is_empty() || self.steps.len() > 6 {
             return Err(invalid("expected one to six steps"));
         }
@@ -363,7 +469,13 @@ impl Proposal {
                 StageAll => strings(&["add", "--all"]),
                 Commit => {
                     if !text(&step.value, 1_000) {
-                        return Err(invalid("commit requires an explicit message"));
+                        // Models sometimes emit commit without a message instead of
+                        // needsClarification; treat that as a clarification outcome.
+                        return Ok(state_plan(
+                            Outcome::NeedsClarification,
+                            self.summary.clone(),
+                            "What commit message should be used?",
+                        ));
                     }
                     vec!["commit".into(), "-m".into(), step.value]
                 }
@@ -659,6 +771,56 @@ fn strings(args: &[&str]) -> Vec<String> {
     args.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// Move mis-filed model output into the fields each action accepts.
+/// Newer on-device builds often put stage/discard filenames in `value`.
+/// Newer on-device builds often put stage/unstage/discard filenames in `value`
+/// instead of `paths`. Move that filename into `paths` when `paths` is empty.
+/// For stage/unstage/discard, also drop a stray `value` when `paths` is already set.
+fn normalize_step_fields(mut step: Step) -> Step {
+    use Action::*;
+    match &step.action {
+        Stage | Unstage => {
+            if step.paths.is_empty() && !step.value.trim().is_empty() {
+                step.paths.push(std::mem::take(&mut step.value));
+            } else if !step.value.is_empty() {
+                step.value.clear();
+            }
+        }
+        Discard => {
+            if step.paths.is_empty() && !step.value.trim().is_empty() {
+                step.paths.push(std::mem::take(&mut step.value));
+            } else if !step.paths.is_empty() {
+                step.value.clear();
+            }
+        }
+        _ => {}
+    }
+    if matches!(&step.action, Stage | Unstage | Discard) {
+        for path in &mut step.paths {
+            *path = strip_wrapping_quotes(path);
+        }
+    }
+    step
+}
+
+fn strip_wrapping_quotes(path: &str) -> String {
+    let trimmed = path.trim();
+    let pairs = [
+        ('"', '"'),
+        ('\'', '\''),
+        ('`', '`'),
+        ('\u{201c}', '\u{201d}'),
+        ('"', '\u{201d}'),
+        ('\u{201c}', '"'),
+    ];
+    for (open, close) in pairs {
+        if trimmed.len() >= 2 && trimmed.starts_with(open) && trimmed.ends_with(close) {
+            return trimmed[open.len_utf8()..trimmed.len() - close.len_utf8()].to_owned();
+        }
+    }
+    trimmed.to_owned()
+}
+
 fn validate_branch(branch: &str) -> Result<(), InvalidPlan> {
     // A deliberately conservative subset of git-check-ref-format's branch syntax.
     if !text(branch, 200)
@@ -686,6 +848,56 @@ fn validate_sha(sha: &str) -> Result<(), InvalidPlan> {
         return Err(invalid("commit SHA must be 7 to 40 hexadecimal characters"));
     }
     Ok(())
+}
+
+/// When the user named a commit SHA and the model answered with a lone
+/// `showReflog` recovery plan, rewrite to `createBranchAt` for that SHA.
+/// Deterministic: never invents a SHA that was not in the request text.
+pub fn rewrite_named_sha_recovery(request: &str, mut proposal: Proposal) -> Proposal {
+    if proposal.outcome != Outcome::Ready || proposal.steps.len() != 1 {
+        return proposal;
+    }
+    if !matches!(proposal.steps[0].action, Action::ShowReflog) {
+        return proposal;
+    }
+    let Some(sha) = first_hex_sha_in_request(request) else {
+        return proposal;
+    };
+    proposal.steps[0] = Step {
+        action: Action::CreateBranchAt {
+            name: format!("recovered/{sha}"),
+            sha: sha.clone(),
+        },
+        value: String::new(),
+        paths: Vec::new(),
+        sha: String::new(),
+    };
+    if !text(&proposal.summary, 1_000) {
+        proposal.summary = format!("Recover commit {sha}");
+    }
+    proposal
+}
+
+/// First 7–40 character hexadecimal token in `request` bounded by non-hex characters.
+fn first_hex_sha_in_request(request: &str) -> Option<String> {
+    let bytes = request.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_hexdigit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            let len = i - start;
+            if (7..=40).contains(&len) {
+                // Reject if adjacent to a longer hex run already consumed; token is exact.
+                return Some(request[start..i].to_string());
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Force the printed branch under `recovered/` without moving the current branch.
@@ -769,6 +981,86 @@ mod tests {
     }
 
     #[test]
+    fn trailing_sentence_punctuation_is_a_path_boundary() {
+        assert!(path_mentioned("discard README.md.", "README.md"));
+        assert!(path_mentioned("discard README.md, please", "README.md"));
+        assert!(path_mentioned("stage README.md!", "README.md"));
+        assert!(path_mentioned("unstage README.md?", "README.md"));
+        assert!(!path_mentioned("discard README.md.bak", "README.md"));
+        assert!(!path_mentioned("discard README.mdx", "README.md"));
+    }
+
+    #[test]
+    fn named_paths_must_appear_in_user_text() {
+        let request = "revert my changes to README.md";
+        let rejected = proposal(Action::Discard, "", &["README.md", "src/main.rs"])
+            .validate_for_request(Path::new("."), request, &[])
+            .unwrap();
+        assert_eq!(rejected.outcome, Outcome::NeedsClarification);
+        assert!(rejected.commands.is_empty());
+        assert!(!rejected.changes_repository);
+
+        let accepted = proposal(Action::Discard, "", &["README.md"])
+            .validate_for_request(Path::new("."), request, &[])
+            .unwrap();
+        assert_eq!(accepted.outcome, Outcome::Ready);
+        assert_eq!(
+            accepted.commands[0].args,
+            strings(&["--literal-pathspecs", "restore", "--", "README.md"])
+        );
+
+        for (action, request) in [
+            (Action::Stage, "stage README.md"),
+            (Action::Unstage, "unstage README.md"),
+        ] {
+            let rejected = proposal(action, "", &["src/main.rs"])
+                .validate_for_request(Path::new("."), request, &[])
+                .unwrap();
+            assert_eq!(rejected.outcome, Outcome::NeedsClarification);
+            assert!(rejected.commands.is_empty());
+        }
+
+        let stage_all = proposal(Action::StageAll, "", &[])
+            .validate_for_request(Path::new("."), "stage all changes", &[])
+            .unwrap();
+        assert_eq!(stage_all.outcome, Outcome::Ready);
+        assert_eq!(stage_all.commands[0].args, strings(&["add", "--all"]));
+    }
+
+    #[test]
+    fn path_scope_uses_typed_answers_and_normalized_steps() {
+        let history = [ClarificationTurn {
+            question: "Which file?".into(),
+            answer: "src/main.rs".into(),
+        }];
+        let accepted = proposal(Action::Unstage, "", &["src/main.rs"])
+            .validate_for_request(Path::new("."), "unstage a file", &history)
+            .unwrap();
+        assert_eq!(accepted.outcome, Outcome::Ready);
+
+        let answer_only_in_question = [ClarificationTurn {
+            question: "Did you mean src/main.rs?".into(),
+            answer: "yes".into(),
+        }];
+        let rejected = proposal(Action::Discard, "", &["src/main.rs"])
+            .validate_for_request(
+                Path::new("."),
+                "revert my changes",
+                &answer_only_in_question,
+            )
+            .unwrap();
+        assert_eq!(rejected.outcome, Outcome::NeedsClarification);
+
+        let misfiled = proposal(Action::Stage, "src/main.rs", &[])
+            .validate_for_request(Path::new("."), "stage README.md", &[])
+            .unwrap();
+        assert_eq!(misfiled.outcome, Outcome::NeedsClarification);
+        assert!(!path_mentioned("README.md.backup", "README.md"));
+        assert!(!path_mentioned("readme.md", "README.md"));
+        assert!(path_mentioned("stage 'README.md', please", "README.md"));
+    }
+
+    #[test]
     fn every_action_has_a_scope_specific_explanation_and_preserves_order() {
         use Action::*;
         let cases = [
@@ -828,10 +1120,10 @@ mod tests {
 
     #[test]
     fn outcome_invariants_fail_closed() {
+        let mut p = proposal(Action::Status, "", &[]);
+        p.outcome = Outcome::NeedsClarification;
+        assert!(p.validate(Path::new(".")).is_err());
         for outcome in [Outcome::NeedsClarification, Outcome::Unsupported] {
-            let mut p = proposal(Action::Status, "", &[]);
-            p.outcome = outcome;
-            assert!(p.validate(Path::new(".")).is_err());
             let mut p = proposal(Action::Status, "", &[]);
             p.outcome = outcome;
             p.steps.clear();
@@ -842,6 +1134,10 @@ mod tests {
             assert!(!plan.changes_repository);
         }
         let mut p = proposal(Action::Status, "", &[]);
+        p.clarification = "A question?".into();
+        assert!(p.validate(Path::new(".")).is_err());
+        let mut p = proposal(Action::Status, "", &[]);
+        p.steps.clear();
         p.clarification = "A question?".into();
         assert!(p.validate(Path::new(".")).is_err());
         let mut p = proposal(Action::Status, "", &[]);
@@ -868,6 +1164,46 @@ mod tests {
             "git commit -m 'fix '\\''login'\\''; $(touch /tmp/pwned)'"
         );
         assert_eq!(plan.commands[0].args.len(), 3);
+    }
+
+    #[test]
+    fn stage_moves_misfiled_value_into_paths() {
+        let plan = proposal(Action::Stage, "notes with spaces.txt", &[])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(
+            plan.commands[0].args,
+            strings(&["--literal-pathspecs", "add", "--", "notes with spaces.txt"])
+        );
+        let literal = proposal(Action::Stage, "--all", &[])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(
+            literal.commands[0].args,
+            strings(&["--literal-pathspecs", "add", "--", "--all"])
+        );
+        let redundant = proposal(Action::Stage, "README.md", &["README.md"])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(
+            redundant.commands[0].args,
+            strings(&["--literal-pathspecs", "add", "--", "README.md"])
+        );
+    }
+
+    #[test]
+    fn unsupported_outcome_drops_leftover_steps() {
+        let mut p = proposal(Action::Push, "", &[]);
+        p.outcome = Outcome::Unsupported;
+        p.summary = "Force push is not supported.".into();
+        p.clarification = "  ".into();
+        let plan = p.validate(Path::new(".")).unwrap();
+        assert!(plan.commands.is_empty());
+        assert_eq!(plan.outcome, Outcome::Unsupported);
+        assert_eq!(
+            plan.clarification.as_deref(),
+            Some("Force push is not supported.")
+        );
     }
 
     #[test]
@@ -924,6 +1260,49 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout, b"--all\0:(glob)*\0a b.txt\0");
+    }
+
+    #[test]
+    fn dumps_raw_proposal_json_when_validation_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw-model-proposal.json");
+        let bad = Proposal {
+            outcome: Outcome::Ready,
+            summary: "stage escape".into(),
+            clarification: String::new(),
+            steps: vec![Step {
+                action: Action::Stage,
+                value: String::new(),
+                paths: vec!["../secret".into()],
+                sha: String::new(),
+            }],
+        };
+        let err = bad
+            .validate_writing_dump_on_failure(Path::new("."), "stage README.md", &[], Some(&path))
+            .expect_err("escape path must fail validation");
+        assert!(
+            err.to_string()
+                .contains("paths must stay inside the repository")
+        );
+        let dumped = std::fs::read_to_string(&path).expect("dump written");
+        let value: serde_json::Value = serde_json::from_str(&dumped).expect("valid json");
+        assert_eq!(value["steps"][0]["paths"][0], "../secret");
+        // Successful validation must not write the dump file.
+        let ok_path = dir.path().join("should-not-exist.json");
+        proposal(Action::Stage, "", &[":(glob)*"])
+            .validate_writing_dump_on_failure(Path::new("."), "stage :(glob)*", &[], Some(&ok_path))
+            .expect("literal pathspec filename is valid");
+        assert!(!ok_path.exists(), "success must not create dump");
+        // No dump path: failure still returns the same error and writes nothing.
+        let missing = dir.path().join("never.json");
+        let err = proposal(Action::Stage, "", &["../secret"])
+            .validate_writing_dump_on_failure(Path::new("."), "stage ../secret", &[], None)
+            .expect_err("escape path must fail");
+        assert!(
+            err.to_string()
+                .contains("paths must stay inside the repository")
+        );
+        assert!(!missing.exists());
     }
 
     #[test]
@@ -991,11 +1370,11 @@ mod tests {
                 .validate(Path::new("."))
                 .is_err()
         );
-        assert!(
-            proposal(Action::Commit, "", &[])
-                .validate(Path::new("."))
-                .is_err()
-        );
+        let empty_commit = proposal(Action::Commit, "", &[])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(empty_commit.outcome, Outcome::NeedsClarification);
+        assert!(empty_commit.commands.is_empty());
     }
 
     #[test]
@@ -1185,6 +1564,34 @@ mod tests {
         let json = serde_json::to_value(command).unwrap();
         assert!(json.get("destructive").is_none());
         assert!(json.get("warning").is_none());
+    }
+
+    #[test]
+    fn named_sha_in_request_rewrites_lone_show_reflog_to_create_branch_at() {
+        let request = "recover the commit abc1234";
+        let mut show = proposal(Action::ShowReflog, "", &[]);
+        show.summary = "Inspect the reflog".into();
+        let rewritten = rewrite_named_sha_recovery(request, show);
+        assert!(matches!(
+            &rewritten.steps[0].action,
+            Action::CreateBranchAt { name, sha }
+                if name == "recovered/abc1234" && sha == "abc1234"
+        ));
+        // Requests without a SHA stay on showReflog.
+        let kept =
+            rewrite_named_sha_recovery("I lost a commit", proposal(Action::ShowReflog, "", &[]));
+        assert!(matches!(kept.steps[0].action, Action::ShowReflog));
+        // Already-correct createBranchAt is left alone.
+        let ready = recovery("abc1234", "abc1234");
+        let same = rewrite_named_sha_recovery(request, ready.clone());
+        assert_eq!(
+            format!("{:?}", same.steps[0].action),
+            format!("{:?}", ready.steps[0].action)
+        );
+        // Hex shorter than 7 is ignored.
+        let short =
+            rewrite_named_sha_recovery("recover ab12", proposal(Action::ShowReflog, "", &[]));
+        assert!(matches!(short.steps[0].action, Action::ShowReflog));
     }
 
     #[test]
@@ -1588,11 +1995,16 @@ mod tests {
                 "{path}"
             );
         }
-        assert!(
-            proposal(Action::Discard, "--hard", &["README.md"])
-                .validate(Path::new("."))
-                .is_err()
+        let stray_value = proposal(Action::Discard, "--hard", &["README.md"])
+            .validate(Path::new("."))
+            .unwrap();
+        assert_eq!(stray_value.outcome, Outcome::Ready);
+        assert_eq!(
+            stray_value.commands[0].args,
+            strings(&["--literal-pathspecs", "restore", "--", "README.md"])
         );
+        assert!(stray_value.commands[0].destructive);
+        assert_eq!(stray_value.commands[0].warning, Some(DISCARD_WARNING));
 
         let plan = proposal(Action::Discard, "", &["README.md", "a b.txt"])
             .validate(Path::new("."))

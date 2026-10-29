@@ -101,6 +101,10 @@ def run_case(case, binary: Path, artifact_dir: Path, timeout: float,
     try:
         repo.mkdir()
         env = isolated_environment(workspace / "config-home")
+        # Eval/debug only: on plan validation failure the binary writes the raw
+        # model proposal JSON here. Success leaves the file absent. Never shown
+        # in normal CLI output.
+        env["GITHELPER_DUMP_PROPOSAL"] = str(artifact_dir / "raw-model-proposal.json")
         setup_count = 0
 
         def git(arguments: list[str]) -> str:
@@ -137,11 +141,21 @@ def run_case(case, binary: Path, artifact_dir: Path, timeout: float,
             result["reasons"].append("repository mutated: " + ", ".join(changed))
         if process["timed_out"]:
             result["reasons"].append(f"timed out after {timeout:g}s")
-        elif process["returncode"] != case.expected_exit:
-            result["reasons"].append(f"exit {process['returncode']}, expected {case.expected_exit}")
         stdout = read_output(artifact_dir / "stdout.txt")
         stderr = read_output(artifact_dir / "stderr.txt")
-        if case.expected_exit == 0 and not process["timed_out"] and process["returncode"] == 0:
+        if process["timed_out"]:
+            pass
+        elif (
+            getattr(case, "accept_validation_error", False)
+            and process["returncode"] != 0
+            and "invalid model proposal" in stderr
+        ):
+            # Safe refusal: model proposed something validation rejected.
+            if stdout.strip():
+                result["reasons"].append("unexpected stdout for validation refusal")
+        elif process["returncode"] != case.expected_exit:
+            result["reasons"].append(f"exit {process['returncode']}, expected {case.expected_exit}")
+        elif case.expected_exit == 0 and process["returncode"] == 0:
             result["reasons"].extend(case.check(json.loads(stdout)))
         elif case.expected_exit != 0:
             if case.expected_stderr not in stderr:
