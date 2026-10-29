@@ -940,8 +940,11 @@ mod plan_path {
                 "invalid model proposal",
             ),
         ];
-        for (fixture, marker) in cases {
-            let output = workspace.run(&fixture, &["--json", "run forbidden operation"]);
+        // The request guard answers dangerous reset phrasing before any model
+        // proposal is read, so proposal validation uses a neutral request here;
+        // the dangerous phrasing is covered right after this loop.
+        for (fixture, marker) in &cases {
+            let output = workspace.run(fixture, &["--json", "run forbidden operation"]);
             assert!(
                 !output.status.success(),
                 "{marker} unexpectedly succeeded: {}",
@@ -955,6 +958,31 @@ mod plan_path {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(stderr.contains(marker), "{marker} not in {stderr}");
             assert!(!stderr.contains("git reset"), "{stderr}");
+            workspace.assert_only_inspected();
+            workspace.assert_unchanged();
+        }
+
+        for (fixture, _) in &cases {
+            let output = workspace.run(fixture, &["--json", "reset --hard and force push"]);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if output.stdout.is_empty() {
+                // An invalid proposal is rejected outright: nothing printed.
+                assert!(!output.status.success());
+                assert!(!String::from_utf8_lossy(&output.stderr).contains("git reset"));
+            } else {
+                let plan: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .unwrap_or_else(|error| panic!("{error}: {stdout}"));
+                assert_eq!(plan["outcome"], "unsupported", "{stdout}");
+                assert_eq!(plan["commands"], serde_json::json!([]), "{stdout}");
+                assert_eq!(plan["changes_repository"], false, "{stdout}");
+                assert!(
+                    plan["summary"]
+                        .as_str()
+                        .is_some_and(|summary| summary.contains("Hard reset isn't supported")),
+                    "{stdout}"
+                );
+            }
+            assert!(!stdout.contains("git reset"), "{stdout}");
             workspace.assert_only_inspected();
             workspace.assert_unchanged();
         }
