@@ -105,7 +105,14 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let result = interaction::clarify(
             |history| {
                 let proposal = bridge.translate(&request, &context, history)?;
-                Ok(plan::rewrite_named_sha_recovery(&request, proposal))
+                let proposal = plan::rewrite_named_sha_recovery(&request, proposal);
+                // A follow-up may supply the remote URL missing from the original request.
+                // Let the model's history-aware proposal through after the first turn.
+                Ok(if history.is_empty() {
+                    plan::rewrite_remote_request(&request, proposal)
+                } else {
+                    proposal
+                })
             },
             &repository,
             &request,
@@ -118,7 +125,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         let model_started = Instant::now();
         let proposal = bridge.translate(&request, &context, &[])?;
         timing("model_call_ms", model_started);
-        let proposal = plan::rewrite_named_sha_recovery(&request, proposal);
+        let proposal = plan::rewrite_remote_request(
+            &request,
+            plan::rewrite_named_sha_recovery(&request, proposal),
+        );
         let validate_started = Instant::now();
         let plan = proposal.validate_dumping_on_failure(&repository, &request, &[])?;
         timing("plan_validation_ms", validate_started);
@@ -160,6 +170,17 @@ fn render_plan(
             "Clarification needed"
         };
         writeln!(output, "{label}: {question}")?;
+        if matches!(plan.outcome, plan::Outcome::Unsupported) {
+            if let Some(manual) = &plan.manual_command {
+                writeln!(output, "Manual command: {manual}")?;
+            }
+            for suggestion in &plan.suggestions {
+                writeln!(output, "Suggestion: {suggestion}")?;
+            }
+            if let Some(feedback) = plan.feedback {
+                writeln!(output, "{feedback}")?;
+            }
+        }
     } else {
         writeln!(output, "{}\n", plan.summary)?;
         for command in &plan.commands {
@@ -244,6 +265,10 @@ mod tests {
                 },
             ],
             changes_repository: true,
+            reason: None,
+            manual_command: None,
+            suggestions: vec![],
+            feedback: None,
         };
         let mut output = Vec::new();
         render_plan(&mut output, &plan, "/repo", false).unwrap();

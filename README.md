@@ -140,6 +140,7 @@ There is no cloud fallback.
 | Stash tracked changes | Leaves untracked files alone |
 | Push | Uses the configured upstream and Git defaults |
 | Pull | Fast-forward only |
+| List, add, or change a remote URL | `git remote -v`, `git remote add <name> <url>`, `git remote set-url <name> <url>` |
 | Recover a lost commit or deleted branch | Reflog inspection, then a new `recovered/<name>` branch at a chosen commit |
 | Undo the last commit | `git reset --soft HEAD~1`. The commit is removed, nothing is lost, and changes stay staged. Warns if that commit is already on the upstream. A root commit asks for clarification instead. |
 | Discard changes to named files | Literal `git restore -- <path>`. Uncommitted changes to those files are lost permanently. |
@@ -151,8 +152,8 @@ clarification. Lost commits and deleted branches are recovered by inspecting
 the reflog and then creating a `recovered/<name>` branch. Undo is only a soft
 reset of `HEAD~1`. Discard names explicit paths and never means `git revert`.
 Hard resets, undoing more than one commit, discarding every change, clean,
-delete, merge, rebase, force push, dropped stashes, and custom remotes or
-refspecs are unsupported. No recovery request produces `git reset`.
+delete, merge, rebase, force push, dropped stashes, removing remotes, and
+custom push/pull refspecs are unsupported. No recovery request produces `git reset`.
 
 ## Recover lost work
 
@@ -236,12 +237,15 @@ that request into `git reset`. File operations use
 expressions. Displayed commands use POSIX shell quoting, suitable for zsh/bash.
 JSON output includes the executable, argument array, and deterministic explanation
 for each command, plus an `outcome`: `ready`, `needsClarification`, or `unsupported`.
+Unsupported results keep an empty `commands` array and include a `reason`, a short
+suggestion, and a link for requesting support. The `clarification` field retains
+the reason for compatibility.
 A destructive step also includes `destructive: true` and the warning text shown
 ahead of that command. Explanations and warnings come from validated Rust
 operations rather than model-generated prose.
 
 For normal translation, local context contains the repository root, current
-branch, up to 32 local branch names, and up to 4,000 characters of tracked-file status. It contains no
+branch, up to 32 local branch names, up to 32 remote names, and up to 4,000 characters of tracked-file status. It contains no
 file contents, diffs, remote URLs, or untracked filenames. Context is collected
 from the repository root even when invoked from a subdirectory. Instructions
 tell the model to treat this metadata as untrusted data. Commit drafting instead

@@ -1,6 +1,7 @@
 use crate::model::ClarificationTurn;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     path::Path,
     process::{Command, Output},
 };
@@ -8,6 +9,8 @@ use thiserror::Error;
 
 const DISCARD_WARNING: &str = "Uncommitted changes to this file are lost permanently.";
 const PUBLISHED_UNDO_WARNING: &str = "This commit is already on the upstream. Rewriting it needs a force push, which githelper does not support.";
+pub const ISSUE_REQUEST: &str =
+    "Want this supported? Open an issue at github.com/arrxy/githelper/issues";
 
 /// Closed set of operations the model may select.
 ///
@@ -20,6 +23,9 @@ pub enum Action {
     StagedDiff,
     Log,
     ListBranches,
+    AddRemote,
+    ListRemotes,
+    SetRemoteUrl,
     CreateBranch,
     SwitchBranch,
     Stage,
@@ -56,6 +62,7 @@ pub struct Step {
     pub paths: Vec<String>,
     /// Set only when a SHA was attached to an action that does not accept one.
     pub sha: String,
+    pub url: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -66,6 +73,8 @@ struct WireStep {
     paths: Vec<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     sha: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    url: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -76,6 +85,9 @@ enum WireAction {
     StagedDiff,
     Log,
     ListBranches,
+    AddRemote,
+    ListRemotes,
+    SetRemoteUrl,
     CreateBranch,
     SwitchBranch,
     Stage,
@@ -91,12 +103,13 @@ enum WireAction {
     Discard,
 }
 
-fn step(action: Action, value: String, paths: Vec<String>, sha: String) -> Step {
+fn step(action: Action, value: String, paths: Vec<String>, sha: String, url: String) -> Step {
     Step {
         action,
         value,
         paths,
         sha,
+        url,
     }
 }
 
@@ -107,6 +120,7 @@ impl From<WireStep> for Step {
             value,
             paths,
             sha,
+            url,
         } = wire;
         match action {
             WireAction::CreateBranchAt => step(
@@ -114,24 +128,28 @@ impl From<WireStep> for Step {
                 String::new(),
                 paths,
                 String::new(),
+                url,
             ),
-            WireAction::Status => step(Action::Status, value, paths, sha),
-            WireAction::Diff => step(Action::Diff, value, paths, sha),
-            WireAction::StagedDiff => step(Action::StagedDiff, value, paths, sha),
-            WireAction::Log => step(Action::Log, value, paths, sha),
-            WireAction::ListBranches => step(Action::ListBranches, value, paths, sha),
-            WireAction::CreateBranch => step(Action::CreateBranch, value, paths, sha),
-            WireAction::SwitchBranch => step(Action::SwitchBranch, value, paths, sha),
-            WireAction::Stage => step(Action::Stage, value, paths, sha),
-            WireAction::StageAll => step(Action::StageAll, value, paths, sha),
-            WireAction::Unstage => step(Action::Unstage, value, paths, sha),
-            WireAction::Commit => step(Action::Commit, value, paths, sha),
-            WireAction::Stash => step(Action::Stash, value, paths, sha),
-            WireAction::Push => step(Action::Push, value, paths, sha),
-            WireAction::Pull => step(Action::Pull, value, paths, sha),
-            WireAction::ShowReflog => step(Action::ShowReflog, value, paths, sha),
-            WireAction::UndoLastCommit => step(Action::UndoLastCommit, value, paths, sha),
-            WireAction::Discard => step(Action::Discard, value, paths, sha),
+            WireAction::Status => step(Action::Status, value, paths, sha, url),
+            WireAction::Diff => step(Action::Diff, value, paths, sha, url),
+            WireAction::StagedDiff => step(Action::StagedDiff, value, paths, sha, url),
+            WireAction::Log => step(Action::Log, value, paths, sha, url),
+            WireAction::ListBranches => step(Action::ListBranches, value, paths, sha, url),
+            WireAction::AddRemote => step(Action::AddRemote, value, paths, sha, url),
+            WireAction::ListRemotes => step(Action::ListRemotes, value, paths, sha, url),
+            WireAction::SetRemoteUrl => step(Action::SetRemoteUrl, value, paths, sha, url),
+            WireAction::CreateBranch => step(Action::CreateBranch, value, paths, sha, url),
+            WireAction::SwitchBranch => step(Action::SwitchBranch, value, paths, sha, url),
+            WireAction::Stage => step(Action::Stage, value, paths, sha, url),
+            WireAction::StageAll => step(Action::StageAll, value, paths, sha, url),
+            WireAction::Unstage => step(Action::Unstage, value, paths, sha, url),
+            WireAction::Commit => step(Action::Commit, value, paths, sha, url),
+            WireAction::Stash => step(Action::Stash, value, paths, sha, url),
+            WireAction::Push => step(Action::Push, value, paths, sha, url),
+            WireAction::Pull => step(Action::Pull, value, paths, sha, url),
+            WireAction::ShowReflog => step(Action::ShowReflog, value, paths, sha, url),
+            WireAction::UndoLastCommit => step(Action::UndoLastCommit, value, paths, sha, url),
+            WireAction::Discard => step(Action::Discard, value, paths, sha, url),
         }
     }
 }
@@ -144,12 +162,14 @@ impl From<Step> for WireStep {
                 value: name,
                 paths: step.paths,
                 sha,
+                url: step.url,
             },
             action => WireStep {
                 action: WireAction::from(&action),
                 value: step.value,
                 paths: step.paths,
                 sha: step.sha,
+                url: step.url,
             },
         }
     }
@@ -163,6 +183,9 @@ impl From<&Action> for WireAction {
             Action::StagedDiff => WireAction::StagedDiff,
             Action::Log => WireAction::Log,
             Action::ListBranches => WireAction::ListBranches,
+            Action::AddRemote => WireAction::AddRemote,
+            Action::ListRemotes => WireAction::ListRemotes,
+            Action::SetRemoteUrl => WireAction::SetRemoteUrl,
             Action::CreateBranch => WireAction::CreateBranch,
             Action::SwitchBranch => WireAction::SwitchBranch,
             Action::Stage => WireAction::Stage,
@@ -196,6 +219,14 @@ pub struct Plan {
     pub clarification: Option<String>,
     pub commands: Vec<GitCommand>,
     pub changes_repository: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(rename = "manualCommand", skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -340,13 +371,7 @@ impl Proposal {
             if !text(&self.clarification, 1_000) || !self.steps.is_empty() {
                 return Err(invalid("clarification must have no commands"));
             }
-            return Ok(Plan {
-                outcome: self.outcome,
-                summary: self.summary,
-                clarification: Some(self.clarification),
-                commands: vec![],
-                changes_repository: false,
-            });
+            return Ok(state_plan(self.outcome, self.summary, self.clarification));
         }
         if !self.clarification.is_empty() {
             return Err(invalid("ready outcome cannot include clarification"));
@@ -366,13 +391,18 @@ impl Proposal {
         }
         let mut commands = Vec::new();
         let mut changes_repository = false;
+        let mut remote_names: Option<HashSet<String>> = None;
         for step in self.steps {
             use Action::*;
             let needs_paths = matches!(&step.action, Stage | Unstage | Discard);
-            let needs_value = matches!(&step.action, CreateBranch | SwitchBranch | Commit);
+            let needs_value = matches!(
+                &step.action,
+                CreateBranch | SwitchBranch | Commit | AddRemote | SetRemoteUrl
+            );
+            let needs_url = matches!(&step.action, AddRemote | SetRemoteUrl);
             let read_only = matches!(
                 &step.action,
-                Status | Diff | StagedDiff | Log | ListBranches | ShowReflog
+                Status | Diff | StagedDiff | Log | ListBranches | ListRemotes | ShowReflog
             );
             if !needs_paths && !step.paths.is_empty() {
                 return Err(invalid("unexpected paths for this action"));
@@ -382,6 +412,33 @@ impl Proposal {
             }
             if !step.sha.is_empty() {
                 return Err(invalid("unexpected sha for this action"));
+            }
+            if !needs_url && !step.url.is_empty() {
+                return Err(invalid("unexpected url for this action"));
+            }
+            if matches!(&step.action, AddRemote) && !step.value.trim().is_empty() {
+                validate_remote_name(&step.value)?;
+                let names = match &mut remote_names {
+                    Some(names) => names,
+                    None => remote_names.insert(remote_names_in(repository)?),
+                };
+                if names.contains(&step.value) {
+                    return Ok(state_plan(
+                        Outcome::NeedsClarification,
+                        self.summary.clone(),
+                        format!(
+                            "Remote {} already exists. Use set-url to change its URL.",
+                            step.value
+                        ),
+                    ));
+                }
+            }
+            if needs_url && (step.value.trim().is_empty() || step.url.trim().is_empty()) {
+                return Ok(state_plan(
+                    Outcome::NeedsClarification,
+                    self.summary.clone(),
+                    "What remote name and URL should I use?",
+                ));
             }
             if matches!(&step.action, Discard) && step.paths.is_empty() {
                 return Ok(state_plan(
@@ -427,6 +484,30 @@ impl Proposal {
                 }
                 Log => strings(&["log", "--oneline", "--max-count=10", "--no-decorate"]),
                 ListBranches => strings(&["branch", "--list"]),
+                ListRemotes => strings(&["remote", "-v"]),
+                AddRemote | SetRemoteUrl => {
+                    validate_remote_name(&step.value)?;
+                    validate_remote_url(&step.url)?;
+                    if matches!(step.action, AddRemote) {
+                        let names = match &mut remote_names {
+                            Some(names) => names,
+                            None => remote_names.insert(remote_names_in(repository)?),
+                        };
+                        if !names.insert(step.value.clone()) {
+                            return Ok(state_plan(
+                                Outcome::NeedsClarification,
+                                self.summary.clone(),
+                                format!(
+                                    "Remote {} already exists. Use set-url to change its URL.",
+                                    step.value
+                                ),
+                            ));
+                        }
+                        vec!["remote".into(), "add".into(), step.value, step.url]
+                    } else {
+                        vec!["remote".into(), "set-url".into(), step.value, step.url]
+                    }
+                }
                 ShowReflog => strings(&["reflog", "-n", "20"]),
                 CreateBranch => {
                     validate_branch(&step.value)?;
@@ -452,6 +533,10 @@ impl Proposal {
                             )),
                             commands: vec![],
                             changes_repository: false,
+                            reason: None,
+                            manual_command: None,
+                            suggestions: vec![],
+                            feedback: None,
                         });
                     }
                     vec!["branch".into(), branch, sha]
@@ -504,6 +589,10 @@ impl Proposal {
             clarification: None,
             commands,
             changes_repository,
+            reason: None,
+            manual_command: None,
+            suggestions: vec![],
+            feedback: None,
         })
     }
 }
@@ -558,6 +647,9 @@ impl Action {
             | Self::StagedDiff
             | Self::Log
             | Self::ListBranches
+            | Self::AddRemote
+            | Self::ListRemotes
+            | Self::SetRemoteUrl
             | Self::ShowReflog
             | Self::CreateBranch
             | Self::CreateBranchAt { .. }
@@ -581,6 +673,9 @@ impl Action {
             Self::StagedDiff => "Shows changes currently staged for commit.",
             Self::Log => "Shows the ten most recent commits.",
             Self::ListBranches => "Lists local branches.",
+            Self::AddRemote => "Adds the named remote with the supplied URL.",
+            Self::ListRemotes => "Lists configured remotes and their fetch and push URLs.",
+            Self::SetRemoteUrl => "Changes the named remote's URL.",
             Self::ShowReflog => {
                 "Shows the 20 most recent reflog entries. Find the lost commit or deleted branch in that list and note its SHA, then ask to recover that SHA."
             }
@@ -613,12 +708,34 @@ impl Action {
 }
 
 fn state_plan(outcome: Outcome, summary: String, clarification: impl Into<String>) -> Plan {
+    let clarification = clarification.into();
+    let unsupported = outcome == Outcome::Unsupported;
+    let lower_reason = clarification.to_ascii_lowercase();
+    let remove_remote = lower_reason.contains("remote") && lower_reason.contains("remov");
+    let suggestion = if remove_remote {
+        "Use set-url if you need to change a remote's URL."
+    } else if lower_reason.contains("force push") {
+        "Use a regular push when history does not need rewriting."
+    } else if lower_reason.contains("commit") && lower_reason.contains("undo") {
+        "Only the latest commit can be undone."
+    } else {
+        "Open an issue to request this operation."
+    };
     Plan {
         outcome,
         summary,
-        clarification: Some(clarification.into()),
+        clarification: Some(clarification.clone()),
         commands: vec![],
         changes_repository: false,
+        reason: unsupported.then_some(clarification),
+        // Text-only hint for unsupported remove; never a runnable plan command.
+        manual_command: (unsupported && remove_remote).then(|| "git remote remove <name>".into()),
+        suggestions: if unsupported {
+            vec![suggestion.into()]
+        } else {
+            vec![]
+        },
+        feedback: unsupported.then_some(ISSUE_REQUEST),
     }
 }
 
@@ -679,6 +796,10 @@ pub fn validate_repository(plan: Plan, repo: &Path) -> Result<Plan, Box<dyn std:
         clarification: None,
         commands,
         changes_repository,
+        reason: None,
+        manual_command: None,
+        suggestions: vec![],
+        feedback: None,
     })
 }
 
@@ -822,6 +943,14 @@ fn strip_wrapping_quotes(path: &str) -> String {
 }
 
 fn validate_branch(branch: &str) -> Result<(), InvalidPlan> {
+    validate_ref_name(branch, "branch")
+}
+
+fn validate_remote_name(name: &str) -> Result<(), InvalidPlan> {
+    validate_ref_name(name, "remote")
+}
+
+fn validate_ref_name(branch: &str, kind: &str) -> Result<(), InvalidPlan> {
     // A deliberately conservative subset of git-check-ref-format's branch syntax.
     if !text(branch, 200)
         || branch.starts_with(['-', '/', '.'])
@@ -836,9 +965,200 @@ fn validate_branch(branch: &str) -> Result<(), InvalidPlan> {
             .split('/')
             .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
     {
-        return Err(invalid("invalid or unsupported branch name"));
+        return Err(InvalidPlan(format!("invalid or unsupported {kind} name")));
     }
     Ok(())
+}
+
+fn validate_remote_url(url: &str) -> Result<(), InvalidPlan> {
+    if !text(url, 2_048) || url.chars().any(char::is_whitespace) {
+        return Err(invalid("invalid or unsupported remote URL"));
+    }
+    let valid = if let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("ssh://"))
+    {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        !host.is_empty() && !host.starts_with('-') && !host.contains('\\')
+    } else if let Some(rest) = url.strip_prefix("git@") {
+        rest.split_once(':').is_some_and(|(host, path)| {
+            !host.is_empty()
+                && !host.starts_with('-')
+                && !host.contains(['/', '\\', '@'])
+                && !path.is_empty()
+        })
+    } else {
+        false
+    };
+    if !valid {
+        return Err(invalid("invalid or unsupported remote URL"));
+    }
+    Ok(())
+}
+
+/// Recover explicit remote requests from model proposals without trusting the
+/// model to copy a user-supplied URL. Names and URLs always come from `request`.
+pub fn rewrite_remote_request(request: &str, mut proposal: Proposal) -> Proposal {
+    let words: Vec<&str> = request
+        .split_whitespace()
+        .map(|word| word.trim_matches(['"', '\'', '`', '(', ')', ',', ';', '.', '!', '?']))
+        .collect();
+    let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
+    let word_is =
+        |index: usize, expected: &str| lower.get(index).is_some_and(|word| word == expected);
+
+    if lower
+        .windows(2)
+        .any(|pair| matches!(pair[0].as_str(), "remove" | "delete") && pair[1] == "remote")
+    {
+        proposal.outcome = Outcome::Unsupported;
+        proposal.summary = "Remove remote".into();
+        proposal.clarification = "Removing remotes is not supported.".into();
+        proposal.steps.clear();
+        return proposal;
+    }
+
+    let has_other_remote_intent = lower.iter().any(|word| {
+        matches!(
+            word.as_str(),
+            "add" | "set" | "set-url" | "change" | "remove" | "delete"
+        )
+    });
+    if !has_other_remote_intent
+        && (lower
+            .windows(2)
+            .any(|pair| matches!(pair[0].as_str(), "list" | "show") && pair[1] == "remotes")
+            || lower.windows(3).any(|pair| {
+                matches!(pair[0].as_str(), "list" | "show")
+                    && pair[1] == "my"
+                    && pair[2] == "remotes"
+            }))
+    {
+        proposal.outcome = Outcome::Ready;
+        proposal.summary = "List remotes".into();
+        proposal.clarification.clear();
+        proposal.steps = vec![step(
+            Action::ListRemotes,
+            String::new(),
+            Vec::new(),
+            String::new(),
+            String::new(),
+        )];
+        return proposal;
+    }
+
+    let set_name_index = (0..words.len()).find_map(|index| {
+        if word_is(index, "set-url") {
+            Some(index + 1)
+        } else if (word_is(index, "set") || word_is(index, "change"))
+            && word_is(index + 1, "remote")
+        {
+            Some(index + 2)
+        } else {
+            None
+        }
+    });
+    if let Some(name_index) = set_name_index {
+        if let (Some(name), Some(url)) = (
+            remote_name_at(&words, name_index),
+            remote_url_after(&words, name_index + 1),
+        ) {
+            proposal.outcome = Outcome::Ready;
+            proposal.summary = format!("Change remote {name} URL");
+            proposal.clarification.clear();
+            proposal.steps = vec![step(
+                Action::SetRemoteUrl,
+                name.to_owned(),
+                Vec::new(),
+                String::new(),
+                url.to_owned(),
+            )];
+        }
+        return proposal;
+    }
+
+    let add_remote_index = (0..words.len()).find_map(|index| {
+        if !word_is(index, "add") {
+            return None;
+        }
+        let mut next = index + 1;
+        if word_is(next, "a") {
+            next += 1;
+        }
+        if word_is(next, "new") {
+            next += 1;
+        }
+        word_is(next, "remote").then_some(next)
+    });
+    if let Some(remote_index) = add_remote_index {
+        let mut name_index = remote_index + 1;
+        if word_is(name_index, "named") {
+            name_index += 1;
+        }
+        if let (Some(name), Some(url)) = (
+            remote_name_at(&words, name_index),
+            remote_url_after(&words, name_index + 1),
+        ) {
+            proposal.outcome = Outcome::Ready;
+            proposal.summary = format!("Add remote {name}");
+            proposal.clarification.clear();
+            proposal.steps = vec![step(
+                Action::AddRemote,
+                name.to_owned(),
+                Vec::new(),
+                String::new(),
+                url.to_owned(),
+            )];
+        } else if remote_url_after(&words, remote_index + 1).is_none() {
+            proposal.outcome = Outcome::NeedsClarification;
+            proposal.summary = "Add remote".into();
+            proposal.clarification = "What remote name and URL should I use?".into();
+            proposal.steps.clear();
+        }
+    }
+    proposal
+}
+
+fn remote_name_at<'a>(words: &'a [&str], index: usize) -> Option<&'a str> {
+    let name = *words.get(index)?;
+    if matches!(
+        name.to_ascii_lowercase().as_str(),
+        "url" | "with" | "to" | "for"
+    ) || validate_remote_name(name).is_err()
+    {
+        return None;
+    }
+    Some(name)
+}
+
+fn remote_url_after<'a>(words: &'a [&str], index: usize) -> Option<&'a str> {
+    let mut next = index;
+    if words.get(next)?.eq_ignore_ascii_case("with") {
+        next += 1;
+    }
+    if words.get(next)?.eq_ignore_ascii_case("url") {
+        next += 1;
+    }
+    if words
+        .get(next)
+        .is_some_and(|word| word.eq_ignore_ascii_case("to"))
+    {
+        next += 1;
+    }
+    let url = *words.get(next)?;
+    validate_remote_url(url).ok()?;
+    Some(url)
+}
+
+fn remote_names_in(repository: &Path) -> Result<HashSet<String>, InvalidPlan> {
+    let output = git(repository, &["remote"])
+        .map_err(|_| invalid("could not inspect configured remotes"))?;
+    if !output.status.success() {
+        return Err(invalid("could not inspect configured remotes"));
+    }
+    let names = String::from_utf8(output.stdout)
+        .map_err(|_| invalid("configured remote names are not UTF-8"))?;
+    Ok(names.lines().map(str::to_owned).collect())
 }
 
 /// Accept 7–40 hexadecimal characters. Git object names are case-insensitive,
@@ -871,6 +1191,7 @@ pub fn rewrite_named_sha_recovery(request: &str, mut proposal: Proposal) -> Prop
         value: String::new(),
         paths: Vec::new(),
         sha: String::new(),
+        url: String::new(),
     };
     if !text(&proposal.summary, 1_000) {
         proposal.summary = format!("Recover commit {sha}");
@@ -976,6 +1297,7 @@ mod tests {
                 value: value.into(),
                 paths: strings(paths),
                 sha: String::new(),
+                url: String::new(),
             }],
         }
     }
@@ -1108,6 +1430,7 @@ mod tests {
             value: "update docs".into(),
             paths: vec![],
             sha: String::new(),
+            url: String::new(),
         });
         let plan = p.validate(Path::new(".")).unwrap();
         assert!(plan.commands[0].explanation.contains("literal paths"));
@@ -1275,6 +1598,7 @@ mod tests {
                 value: String::new(),
                 paths: vec!["../secret".into()],
                 sha: String::new(),
+                url: String::new(),
             }],
         };
         let err = bad
@@ -1392,6 +1716,142 @@ mod tests {
         );
     }
 
+    fn remote_proposal(action: Action, name: &str, url: &str) -> Proposal {
+        let mut proposed = proposal(action, name, &[]);
+        proposed.steps[0].url = url.into();
+        proposed
+    }
+
+    #[test]
+    fn remote_commands_have_exact_arguments_and_state_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (action, name, url, args, mutates) in [
+            (
+                Action::ListRemotes,
+                "",
+                "",
+                strings(&["remote", "-v"]),
+                false,
+            ),
+            (
+                Action::AddRemote,
+                "upstream",
+                "https://example.com/repo.git",
+                strings(&["remote", "add", "upstream", "https://example.com/repo.git"]),
+                true,
+            ),
+            (
+                Action::SetRemoteUrl,
+                "origin",
+                "git@example.com:team/repo.git",
+                strings(&[
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@example.com:team/repo.git",
+                ]),
+                true,
+            ),
+        ] {
+            let plan = remote_proposal(action, name, url)
+                .validate(dir.path())
+                .unwrap();
+            assert_eq!(plan.outcome, Outcome::Ready);
+            assert_eq!(plan.commands[0].args, args);
+            assert_eq!(plan.changes_repository, mutates);
+            assert!(!plan.commands[0].destructive);
+        }
+    }
+
+    #[test]
+    fn remote_inputs_fail_closed_or_clarify() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        for url in [
+            "http://example.com/repo",
+            "file:///tmp/repo",
+            "git@host",
+            "https://",
+            "ssh://",
+            "https://host/a b",
+        ] {
+            assert!(
+                remote_proposal(Action::AddRemote, "upstream", url)
+                    .validate(dir.path())
+                    .is_err(),
+                "{url}"
+            );
+        }
+        for name in ["", "-origin", "bad name", "bad\nname", "a..b", "a/.b"] {
+            let result = remote_proposal(Action::AddRemote, name, "https://example.com/repo.git")
+                .validate(dir.path());
+            if name.is_empty() {
+                assert_eq!(result.unwrap().outcome, Outcome::NeedsClarification);
+            } else {
+                assert!(result.is_err(), "{name}");
+            }
+        }
+        for action in [Action::AddRemote, Action::SetRemoteUrl] {
+            assert_eq!(
+                remote_proposal(action, "origin", "")
+                    .validate(dir.path())
+                    .unwrap()
+                    .outcome,
+                Outcome::NeedsClarification
+            );
+        }
+        let output = Command::new("git")
+            .args(["remote", "add", "origin", "https://example.com/old.git"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let plan = remote_proposal(Action::AddRemote, "origin", "https://example.com/new.git")
+            .validate(dir.path())
+            .unwrap();
+        assert_eq!(plan.outcome, Outcome::NeedsClarification);
+        assert!(plan.clarification.unwrap().contains("set-url"));
+        assert!(plan.commands.is_empty());
+        let without_url = remote_proposal(Action::AddRemote, "origin", "")
+            .validate(dir.path())
+            .unwrap();
+        assert!(without_url.clarification.unwrap().contains("set-url"));
+    }
+
+    #[test]
+    fn remove_remote_proposal_stays_unsupported() {
+        let mut proposed = proposal(Action::ListRemotes, "", &[]);
+        proposed.outcome = Outcome::Unsupported;
+        proposed.clarification = "Removing remotes is not supported.".into();
+        let plan = proposed.validate(Path::new(".")).unwrap();
+        assert_eq!(plan.outcome, Outcome::Unsupported);
+        assert!(plan.commands.is_empty());
+        assert_eq!(
+            plan.reason.as_deref(),
+            Some("Removing remotes is not supported.")
+        );
+        assert_eq!(
+            plan.manual_command.as_deref(),
+            Some("git remote remove <name>")
+        );
+        assert_eq!(plan.feedback, Some(ISSUE_REQUEST));
+    }
+
     macro_rules! each_action {
         ($($action:ident => $value:expr, $paths:expr;)*) => {
             fn each_action(
@@ -1415,6 +1875,9 @@ mod tests {
         StagedDiff => "", &[];
         Log => "", &[];
         ListBranches => "", &[];
+        AddRemote => "upstream", &[];
+        ListRemotes => "", &[];
+        SetRemoteUrl => "upstream", &[];
         CreateBranch => "feature/test", &[];
         SwitchBranch => "main", &[];
         Stage => "", &["README.md"];
@@ -1440,10 +1903,11 @@ mod tests {
             );
             let destructive = action.destructive();
             let warning = action.warning();
-            let command = &proposal(action.clone(), value, paths)
-                .validate(Path::new("."))
-                .unwrap()
-                .commands[0];
+            let mut proposed = proposal(action.clone(), value, paths);
+            if matches!(action, Action::AddRemote | Action::SetRemoteUrl) {
+                proposed.steps[0].url = "https://example.com/repo.git".into();
+            }
+            let command = &proposed.validate(Path::new(".")).unwrap().commands[0];
             assert_eq!(command.destructive, destructive);
             assert_eq!(command.warning, warning);
             let json = serde_json::to_value(command).unwrap();
@@ -1564,6 +2028,96 @@ mod tests {
         let json = serde_json::to_value(command).unwrap();
         assert!(json.get("destructive").is_none());
         assert!(json.get("warning").is_none());
+    }
+
+    #[test]
+    fn remote_set_url_rewrites_wrong_unsupported_proposal() {
+        let mut wrong = proposal(Action::Status, "", &[]);
+        wrong.outcome = Outcome::Unsupported;
+        wrong.clarification = "URL unsupported".into();
+        let rewritten = rewrite_remote_request(
+            "set remote origin URL to https://example.com/new.git",
+            wrong,
+        );
+        assert_eq!(rewritten.outcome, Outcome::Ready);
+        assert!(rewritten.clarification.is_empty());
+        assert_eq!(rewritten.steps.len(), 1);
+        let step = &rewritten.steps[0];
+        assert!(matches!(step.action, Action::SetRemoteUrl));
+        assert_eq!(step.value, "origin");
+        assert_eq!(step.url, "https://example.com/new.git");
+        assert!(step.paths.is_empty());
+        assert!(step.sha.is_empty());
+        for request in [
+            "set-url origin ssh://example.com/new.git",
+            "change remote origin to git@example.com:new.git",
+        ] {
+            let rewritten = rewrite_remote_request(request, proposal(Action::Status, "", &[]));
+            assert!(matches!(rewritten.steps[0].action, Action::SetRemoteUrl));
+            assert_eq!(rewritten.steps[0].value, "origin");
+        }
+    }
+
+    #[test]
+    fn remote_add_rewrites_name_and_url_from_request() {
+        for request in [
+            "add remote upstream https://example.com/new.git",
+            "add a remote named upstream with url https://example.com/new.git",
+        ] {
+            let rewritten = rewrite_remote_request(request, proposal(Action::Status, "", &[]));
+            assert_eq!(rewritten.outcome, Outcome::Ready);
+            assert_eq!(rewritten.steps.len(), 1);
+            assert!(matches!(rewritten.steps[0].action, Action::AddRemote));
+            assert_eq!(rewritten.steps[0].value, "upstream");
+            assert_eq!(rewritten.steps[0].url, "https://example.com/new.git");
+        }
+    }
+
+    #[test]
+    fn remote_add_without_url_asks_for_name_and_url() {
+        for request in ["add remote", "add a remote", "I want to add new remote"] {
+            let rewritten = rewrite_remote_request(request, proposal(Action::Status, "", &[]));
+            assert_eq!(rewritten.outcome, Outcome::NeedsClarification);
+            assert_eq!(
+                rewritten.clarification,
+                "What remote name and URL should I use?"
+            );
+            assert!(rewritten.steps.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_remove_is_unsupported_even_if_model_is_ready() {
+        for request in ["remove remote origin", "delete remote origin"] {
+            let rewritten = rewrite_remote_request(request, proposal(Action::Status, "", &[]));
+            assert_eq!(rewritten.outcome, Outcome::Unsupported);
+            assert_eq!(
+                rewritten.clarification,
+                "Removing remotes is not supported."
+            );
+            assert!(rewritten.steps.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_list_rewrites_to_one_list_step() {
+        for request in ["list remotes", "show remotes", "list my remotes"] {
+            let rewritten = rewrite_remote_request(request, proposal(Action::Status, "", &[]));
+            assert_eq!(rewritten.outcome, Outcome::Ready);
+            assert_eq!(rewritten.steps.len(), 1);
+            let step = &rewritten.steps[0];
+            assert!(matches!(step.action, Action::ListRemotes));
+            assert!(step.value.is_empty());
+            assert!(step.url.is_empty());
+        }
+    }
+
+    #[test]
+    fn unrelated_request_keeps_original_proposal() {
+        let original = proposal(Action::Status, "", &[]);
+        let expected = serde_json::to_value(&original).unwrap();
+        let actual = rewrite_remote_request("show my repository status", original);
+        assert_eq!(serde_json::to_value(actual).unwrap(), expected);
     }
 
     #[test]
@@ -1847,6 +2401,7 @@ mod tests {
             value: String::new(),
             paths: vec![],
             sha: String::new(),
+            url: String::new(),
         });
         assert!(repeated.validate(Path::new(".")).is_err());
     }
