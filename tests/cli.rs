@@ -941,7 +941,7 @@ mod plan_path {
             ),
         ];
         for (fixture, marker) in cases {
-            let output = workspace.run(&fixture, &["--json", "reset --hard and force push"]);
+            let output = workspace.run(&fixture, &["--json", "run forbidden operation"]);
             assert!(
                 !output.status.success(),
                 "{marker} unexpectedly succeeded: {}",

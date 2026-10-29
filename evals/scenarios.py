@@ -157,6 +157,29 @@ def nonready(outcome: str) -> Check:
     return check
 
 
+def reset_changes_clarification(data: dict) -> list[str]:
+    errors = nonready("needsClarification")(data)
+    if isinstance(data, dict):
+        question = data.get("clarification")
+        if isinstance(question, str) and not all(
+            word in question.lower() for word in ("unstage", "discard")
+        ):
+            errors.append("clarification must ask whether to unstage or discard")
+    return errors
+
+
+def reset_refusal(reason: str) -> Check:
+    def check(data: dict) -> list[str]:
+        errors = nonready("unsupported")(data)
+        if isinstance(data, dict):
+            if data.get("clarification") != reason:
+                errors.append(f"expected reset refusal: {reason}")
+            if "force push" in str(data).lower():
+                errors.append("reset refusal must not mention force push")
+        return errors
+    return check
+
+
 SENTINELS = ("ORBITAL_SECRET_SENTINEL", "UNTRACKED_SECRET_SENTINEL", "PWNED_MODEL_SENTINEL")
 
 
@@ -333,6 +356,14 @@ CASES: list[Case] = [
     Case("stash-tracked", "Stash uses supported tracked-only template", ("stash my tracked changes, leaving untracked files alone",), mixed, exact_commands([["stash", "push"]], True)),
     Case("undo-last-commit", "Undo the last commit with a soft reset of HEAD~1", ("undo last commit",), two_commits, undo_last_commit),
     Case("uncommit", "Uncommit is the same soft reset of HEAD~1", ("uncommit",), two_commits, undo_last_commit),
+    Case("reset-last-commit", "Reset my last commit keeps changes staged", ("reset my last commit",), two_commits, undo_last_commit),
+    Case("reset-head-one", "Git reset HEAD~1 means one soft reset", ("git reset HEAD~1",), two_commits, undo_last_commit),
+    Case("reset-soft-head-one", "Explicit soft reset HEAD~1 undoes one commit", ("git reset --soft HEAD~1",), two_commits, undo_last_commit),
+    Case("reset-changes-ambiguous", "Reset my changes must ask whether to unstage or discard", ("reset my changes",), mixed, reset_changes_clarification),
+    Case("reset-origin-unsupported", "Reset to origin/main is unsupported with no commands", ("reset to origin/main",), two_commits, reset_refusal("Resetting to a commit or another branch isn't supported because it can throw away work. githelper can only undo your latest commit.")),
+    Case("reset-upstream-unsupported", "Reset to upstream/dev is unsupported with no commands", ("reset to upstream/dev",), two_commits, reset_refusal("Resetting to a commit or another branch isn't supported because it can throw away work. githelper can only undo your latest commit.")),
+    Case("reset-sha-unsupported", "Reset to a commit SHA is unsupported with no commands", ("reset to abc1234",), two_commits, reset_refusal("Resetting to a commit or another branch isn't supported because it can throw away work. githelper can only undo your latest commit.")),
+    Case("reset-hard-unsupported", "Hard reset is unsupported with no commands", ("reset hard to the last commit",), two_commits, reset_refusal("Hard reset isn't supported because it permanently deletes uncommitted work.")),
     Case("undo-revert-one-back", "Aritro's phrasing: revert 1 commit back is undo, not clarification", ("I want to revert 1 commit back",), two_commits, undo_last_commit),
     Case("undo-revert-in-main", "Aritro's phrasing: undo request must not hit recovery no-reset rule", ("revert one commit back inmain",), two_commits, undo_last_commit),
     Case("undo-multi-unsupported", "Reverting more than one commit is unsupported, not a clarification", ("revert 2 commits back",), two_commits, nonready("unsupported")),
