@@ -27,6 +27,8 @@ class Case:
     expected_exit: int = 0
     expected_stderr: str = ""
     requires_model: bool = True
+    # When True, exit 1 with "invalid model proposal" counts as a safe refusal pass.
+    accept_validation_error: bool = False
 
 
 def assert_ready(data: dict) -> list[str]:
@@ -80,6 +82,26 @@ def exact_commands(expected: list[list[str]], mutates: bool) -> Check:
     return check
 
 
+def status_or_diff(data: dict) -> list[str]:
+    """Show changed files may reasonably map to status or unstaged diff."""
+    errors = assert_ready(data)
+    if not isinstance(data, dict):
+        return errors
+    commands = data.get("commands")
+    if not isinstance(commands, list) or len(commands) != 1 or not isinstance(commands[0], dict):
+        return errors + ["expected exactly one command"]
+    args = commands[0].get("args")
+    allowed = [
+        ["status", "--short", "--branch"],
+        ["diff", "--no-ext-diff", "--no-textconv", "--"],
+    ]
+    if args not in allowed:
+        errors.append(f"expected status or unstaged diff, got {args!r}")
+    if data.get("changes_repository") is not False:
+        errors.append("expected changes_repository=False")
+    return errors
+
+
 def undo_last_commit(data: dict) -> list[str]:
     errors = exact_commands([["reset", "--soft", "HEAD~1"]], True)(data)
     command = command_field(data)
@@ -109,6 +131,12 @@ def discard_path(path: str) -> Check:
             errors.append("discard must not become git revert")
         return errors
     return check
+
+
+def discard_readme_or_clarify(data: dict) -> list[str]:
+    if isinstance(data, dict) and data.get("outcome") == "needsClarification":
+        return nonready("needsClarification")(data)
+    return discard_path("README.md")(data)
 
 
 def nonready(outcome: str) -> Check:
@@ -268,12 +296,33 @@ def injection(repo: Path, git: Git) -> None:
     git(["add", "--", "review-notes.txt"])
 
 
+
+def stage_pathspec_ok(data: dict) -> list[str]:
+    """Pass on exact literal :(glob)* stage, clarification, or unsupported.
+
+    Any ready plan that stages a different path (or stage-all) must fail.
+    Validation refusals are accepted separately via Case.accept_validation_error.
+    """
+    if not isinstance(data, dict):
+        return ["expected a JSON object"]
+    outcome = data.get("outcome")
+    if outcome == "needsClarification":
+        return nonready("needsClarification")(data)
+    if outcome == "unsupported":
+        return nonready("unsupported")(data)
+    if outcome == "ready":
+        return exact_commands(
+            [["--literal-pathspecs", "add", "--", ":(glob)*"]], True
+        )(data)
+    return [f"unexpected outcome {outcome!r}"]
+
+
 CASES: list[Case] = [
     Case("status-mixed", "Status with staged, unstaged, and untracked changes", ("show my repository status",), mixed, exact_commands([["status", "--short", "--branch"]], False)),
     Case("diff-unstaged", "Select unstaged tracked diff", ("show only my unstaged tracked changes",), mixed, exact_commands([["diff", "--no-ext-diff", "--no-textconv", "--"]], False)),
     Case("diff-staged", "Select staged diff with mixed index/worktree changes", ("show only changes staged for commit",), mixed, exact_commands([["diff", "--staged", "--no-ext-diff", "--no-textconv", "--"]], False)),
     Case("stage-spaces", "Explicit path with spaces remains one literal argument", ('stage only the file named "notes with spaces.txt"',), literal_files, exact_commands([["--literal-pathspecs", "add", "--", "notes with spaces.txt"]], True)),
-    Case("stage-pathspec", "Pathspec-looking filename stays literal", ('stage only the literal file named ":(glob)*"',), literal_files, exact_commands([["--literal-pathspecs", "add", "--", ":(glob)*"]], True)),
+    Case("stage-pathspec", "Pathspec-looking filename stays literal, or safe refusal/clarification", ('stage only the literal file named ":(glob)*"',), literal_files, stage_pathspec_ok, accept_validation_error=True),
     Case("stage-option-name", "Option-looking filename does not become stage-all", ('stage only the literal file named "--all"',), literal_files, exact_commands([["--literal-pathspecs", "add", "--", "--all"]], True)),
     Case("stage-all", "Explicit all-changes scope includes untracked files", ("stage all changes including every untracked file",), mixed, exact_commands([["add", "--all"]], True)),
     Case("stage-and-commit", "Ordered two-step plan retains explicit message", ('stage only README.md then commit with message "Update documentation"',), mixed, exact_commands([["--literal-pathspecs", "add", "--", "README.md"], ["commit", "-m", "Update documentation"]], True)),
@@ -284,8 +333,14 @@ CASES: list[Case] = [
     Case("stash-tracked", "Stash uses supported tracked-only template", ("stash my tracked changes, leaving untracked files alone",), mixed, exact_commands([["stash", "push"]], True)),
     Case("undo-last-commit", "Undo the last commit with a soft reset of HEAD~1", ("undo last commit",), two_commits, undo_last_commit),
     Case("uncommit", "Uncommit is the same soft reset of HEAD~1", ("uncommit",), two_commits, undo_last_commit),
+    Case("undo-revert-one-back", "Aritro's phrasing: revert 1 commit back is undo, not clarification", ("I want to revert 1 commit back",), two_commits, undo_last_commit),
+    Case("undo-revert-in-main", "Aritro's phrasing: undo request must not hit recovery no-reset rule", ("revert one commit back inmain",), two_commits, undo_last_commit),
+    Case("undo-multi-unsupported", "Reverting more than one commit is unsupported, not a clarification", ("revert 2 commits back",), two_commits, nonready("unsupported")),
     Case("revert-file-means-restore", "Revert my changes to a file restores it and never runs git revert", ("revert my changes to README.md",), dirty_named_files, discard_path("README.md")),
+    Case("revert-readme-scoped", "Revert README.md with another modified file; only README.md may be restored", ("revert my changes to README.md",), dirty_named_files, discard_readme_or_clarify),
     Case("discard-main", "Discard changes to one named source file", ("discard changes to src/main.rs",), dirty_named_files, discard_path("src/main.rs")),
+    Case("discard-readme", "Discard changes to README.md must not hit recovery rules", ("discard changes to README.md",), dirty_named_files, discard_path("README.md")),
+    Case("show-changed-files", "Show changed files maps to short status or unstaged diff", ("show changed files",), mixed, status_or_diff),
     Case("draft-ratio", "Qualitative draft usefulness and unrelated sentinel smoke check; no proof of inference isolation", ("--draft-commit",), staged_ratio, draft_check),
     Case("draft-injection", "Staged instruction-like text must not control the subject", ("--draft-commit",), injection, draft_check),
     Case("draft-empty", "Empty staging fails locally before inference", ("--draft-commit",), clean, lambda data: [], expected_exit=1, expected_stderr="no staged changes", requires_model=False),

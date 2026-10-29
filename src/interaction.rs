@@ -13,13 +13,15 @@ type Error = Box<dyn std::error::Error>;
 pub fn clarify(
     mut translate: impl FnMut(&[ClarificationTurn]) -> Result<Proposal, Error>,
     repository: &Path,
+    request: &str,
     input: &mut impl BufRead,
     prompts: &mut impl Write,
 ) -> Result<Option<Plan>, Error> {
     let mut history = Vec::new();
     let mut history_bytes = 0;
     loop {
-        let plan = translate(&history)?.validate(repository)?;
+        let plan =
+            translate(&history)?.validate_dumping_on_failure(repository, request, &history)?;
         match plan.outcome {
             Outcome::Ready => return Ok(Some(plan)),
             Outcome::Unsupported => {
@@ -127,6 +129,7 @@ mod tests {
                 }
             },
             Path::new("."),
+            "show my changes",
             &mut Cursor::new(b"unstaged\n"),
             &mut Vec::new(),
         )
@@ -145,6 +148,7 @@ mod tests {
                 Ok(proposal(Outcome::NeedsClarification))
             },
             Path::new("."),
+            "show my changes",
             &mut Cursor::new(b"one\ntwo\nthree\nfour\n"),
             &mut Vec::new(),
         );
@@ -163,6 +167,7 @@ mod tests {
                         Ok(proposal(Outcome::NeedsClarification))
                     },
                     Path::new("."),
+                    "show my changes",
                     &mut Cursor::new(input),
                     &mut Vec::new()
                 )
@@ -176,6 +181,7 @@ mod tests {
             clarify(
                 |_| Ok(proposal(Outcome::Unsupported)),
                 Path::new("."),
+                "show my changes",
                 &mut input,
                 &mut Vec::new()
             )
@@ -214,6 +220,7 @@ mod tests {
                 Ok(proposal(Outcome::NeedsClarification))
             },
             Path::new("."),
+            "show my changes",
             &mut Cursor::new(b"invalid\tanswer\n"),
             &mut Vec::new(),
         );
@@ -230,6 +237,7 @@ mod tests {
                 }
             },
             Path::new("."),
+            "show my changes",
             &mut Cursor::new(b"unstaged\n"),
             &mut Vec::new(),
         );
@@ -248,6 +256,7 @@ mod tests {
             clarify(
                 |_| Err("inference failed".into()),
                 Path::new("."),
+                "show my changes",
                 &mut Cursor::new(b""),
                 &mut Vec::new()
             )
@@ -261,6 +270,7 @@ mod tests {
                     Ok(p)
                 },
                 Path::new("."),
+                "show my changes",
                 &mut Cursor::new(b""),
                 &mut Vec::new()
             )

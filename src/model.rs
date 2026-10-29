@@ -1,4 +1,8 @@
-use crate::{commit_message::CommitMessage, plan::Proposal, repository::Context};
+use crate::{
+    commit_message::{CommitMessage, sanitize_staged_patch},
+    plan::Proposal,
+    repository::Context,
+};
 use serde::{Deserialize, Serialize};
 
 pub struct AppleModel;
@@ -77,15 +81,16 @@ impl AppleModel {
         &self,
         staged_diff: &str,
     ) -> Result<CommitMessage, Box<dyn std::error::Error>> {
+        let sanitized = sanitize_staged_patch(staged_diff);
         match invoke(&Request {
             mode: "draftCommit",
             request: None,
             context: None,
             history: None,
-            staged_diff: Some(staged_diff),
+            staged_diff: Some(&sanitized),
         })? {
             Response::CommitMessage { commit_message } => commit_message.validate(),
-            _ => Err("unexpected model commit message response".into()),
+            _ => Err("unexpected model commit_message response".into()),
         }
     }
 }
@@ -154,7 +159,16 @@ fn platform_invoke(request: &Request<'_>) -> Result<Response, Box<dyn std::error
         };
         const HELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/githelper-model"));
         let helper = helper_cache::cached_helper_path(HELPER, &helper_cache::user_cache_dir()?)?;
-        let mut child = Command::new(helper)
+        if matches!(
+            std::env::var("GITHELPER_TIMINGS").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            eprintln!(
+                "githelper.timing model_bridge_spawn=1 helper={}",
+                helper.display()
+            );
+        }
+        let mut child = Command::new(&helper)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -320,13 +334,35 @@ mod helper_cache {
         }
         ensure_private_dir(cache_dir)?;
         let path = cache_dir.join(format!("githelper-model-{}", content_id(bytes)));
+        let timings = matches!(
+            std::env::var("GITHELPER_TIMINGS").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        );
         for _ in 0..2 {
             if verified_helper(&path, bytes) {
+                if timings {
+                    eprintln!(
+                        "githelper.timing helper_cache=reused path={}",
+                        path.display()
+                    );
+                }
                 return Ok(path);
+            }
+            if timings {
+                eprintln!(
+                    "githelper.timing helper_cache=install path={}",
+                    path.display()
+                );
             }
             install_helper(&path, bytes)?;
         }
         if verified_helper(&path, bytes) {
+            if timings {
+                eprintln!(
+                    "githelper.timing helper_cache=reused path={}",
+                    path.display()
+                );
+            }
             Ok(path)
         } else {
             Err("cached model helper failed verification".into())
