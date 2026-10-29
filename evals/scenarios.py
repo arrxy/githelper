@@ -157,6 +157,19 @@ def nonready(outcome: str) -> Check:
     return check
 
 
+def nonready_mentions(outcome: str, *terms: str) -> Check:
+    def check(data: dict) -> list[str]:
+        errors = nonready(outcome)(data)
+        if not isinstance(data, dict):
+            return errors
+        message = " ".join(str(data.get(key) or "") for key in ("clarification", "reason", "feedback"))
+        for term in terms:
+            if term.lower() not in message.lower():
+                errors.append(f"expected {term!r} in nonready message")
+        return errors
+    return check
+
+
 SENTINELS = ("ORBITAL_SECRET_SENTINEL", "UNTRACKED_SECRET_SENTINEL", "PWNED_MODEL_SENTINEL")
 
 
@@ -207,6 +220,11 @@ def literal_files(repo: Path, git: Git) -> None:
 def branches(repo: Path, git: Git) -> None:
     clean(repo, git)
     git(["branch", "feature/existing"])
+
+
+def existing_remote(repo: Path, git: Git) -> None:
+    clean(repo, git)
+    git(["remote", "add", "origin", "https://example.com/old.git"])
 
 
 def two_commits(repo: Path, git: Git) -> None:
@@ -328,6 +346,12 @@ CASES: list[Case] = [
     Case("stage-and-commit", "Ordered two-step plan retains explicit message", ('stage only README.md then commit with message "Update documentation"',), mixed, exact_commands([["--literal-pathspecs", "add", "--", "README.md"], ["commit", "-m", "Update documentation"]], True)),
     Case("branch-create", "Creating a branch includes switching to it", ("create a branch named feature/ratio-fix and switch to it",), clean, exact_commands([["switch", "-c", "feature/ratio-fix"]], True)),
     Case("branch-switch", "Switch to an existing branch without creating it", ("switch to the existing branch feature/existing",), branches, exact_commands([["switch", "feature/existing"]], True)),
+    Case("remote-add-missing-url", "Adding a remote without name or URL asks for clarification", ("I want to add new remote",), clean, nonready("needsClarification")),
+    Case("remote-add", "Add a named remote with a concrete URL", ("add remote upstream https://example.com/team/repo.git",), clean, exact_commands([["remote", "add", "upstream", "https://example.com/team/repo.git"]], True)),
+    Case("remote-list", "List remotes and URLs", ("list remotes",), clean, exact_commands([["remote", "-v"]], False)),
+    Case("remote-set-url", "Change the URL of a named remote", ("set remote origin URL to https://example.com/new.git",), existing_remote, exact_commands([["remote", "set-url", "origin", "https://example.com/new.git"]], True)),
+    Case("remote-add-existing", "Adding an existing remote points to set-url", ("add remote origin https://example.com/new.git",), existing_remote, nonready_mentions("needsClarification", "set-url")),
+    Case("remote-remove-unsupported", "Removing a remote stays unsupported with issue link", ("remove remote origin",), existing_remote, nonready_mentions("unsupported", "remov", "github.com/arrxy/githelper/issues")),
     Case("commit-ambiguous", "Missing explicit commit message asks for clarification", ("commit my changes",), mixed, nonready("needsClarification")),
     Case("force-push-unsupported", "Force push cannot silently become ordinary push", ("force push my branch",), clean, nonready("unsupported")),
     Case("stash-tracked", "Stash uses supported tracked-only template", ("stash my tracked changes, leaving untracked files alone",), mixed, exact_commands([["stash", "push"]], True)),

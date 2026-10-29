@@ -9,6 +9,7 @@ pub struct Context {
     pub root: String,
     pub current_branch: String,
     pub local_branches: Vec<String>,
+    pub remotes: Vec<String>,
     pub tracked_status: String,
 }
 
@@ -45,6 +46,7 @@ pub fn inspect(directory: &Path) -> Result<Context, Box<dyn std::error::Error>> 
             "refs/heads/",
         ],
     )?;
+    let remotes = git(&root_path, &["remote"])?;
     let status = git(
         &root_path,
         &["status", "--porcelain=v1", "--untracked-files=no"],
@@ -68,6 +70,7 @@ pub fn inspect(directory: &Path) -> Result<Context, Box<dyn std::error::Error>> 
             current_branch
         },
         local_branches: branches.lines().map(str::to_owned).collect(),
+        remotes: remotes.lines().take(32).map(str::to_owned).collect(),
         tracked_status,
     })
 }
@@ -97,7 +100,15 @@ mod tests {
         );
         assert_eq!(context.current_branch, "main");
         assert!(context.local_branches.is_empty());
+        assert!(context.remotes.is_empty());
         assert_eq!(context.tracked_status, "(clean: no modified tracked files)");
+        let output = Command::new("git")
+            .args(["remote", "add", "origin", "https://example.com/repo.git"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(inspect(&child).unwrap().remotes, ["origin"]);
     }
 
     #[test]

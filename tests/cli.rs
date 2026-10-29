@@ -381,6 +381,7 @@ mod plan_path {
                 line.contains("--porcelain=v1") && line.contains("--untracked-files=no")
             }
             Some("branch") => line.contains("--show-current"),
+            Some("remote") => line.trim_end().ends_with(" remote"),
             _ => false,
         }
     }
@@ -836,7 +837,7 @@ mod plan_path {
         );
         assert_eq!(
             String::from_utf8(text.stdout).unwrap(),
-            "Unsupported request: Force push is not supported.\n"
+            "Unsupported request: Force push is not supported.\nSuggestion: Use a regular push when history does not need rewriting.\nWant this supported? Open an issue at github.com/arrxy/githelper/issues\n"
         );
         workspace.assert_only_inspected();
         workspace.assert_unchanged();
@@ -848,8 +849,136 @@ mod plan_path {
         );
         let json: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
         assert_eq!(json["outcome"], "unsupported");
+        assert_eq!(json["reason"], "Force push is not supported.");
+        assert_eq!(
+            json["feedback"],
+            "Want this supported? Open an issue at github.com/arrxy/githelper/issues"
+        );
         assert_eq!(json["commands"], serde_json::json!([]));
         assert_eq!(json["changes_repository"], false);
+        workspace.assert_only_inspected();
+        workspace.assert_unchanged();
+    }
+
+    #[cfg(feature = "fake-model")]
+    #[test]
+    fn remote_plans_are_printed_without_running_them() {
+        let workspace = Workspace::new();
+        for (action, name, url, request, args, mutates) in [
+            (
+                "listRemotes",
+                "",
+                "",
+                "list remotes",
+                serde_json::json!(["remote", "-v"]),
+                false,
+            ),
+            (
+                "addRemote",
+                "upstream",
+                "https://example.com/repo.git",
+                "add remote upstream https://example.com/repo.git",
+                serde_json::json!(["remote", "add", "upstream", "https://example.com/repo.git"]),
+                true,
+            ),
+            (
+                "setRemoteUrl",
+                "origin",
+                "git@example.com:team/repo.git",
+                "set remote origin URL to git@example.com:team/repo.git",
+                serde_json::json!([
+                    "remote",
+                    "set-url",
+                    "origin",
+                    "git@example.com:team/repo.git"
+                ]),
+                true,
+            ),
+        ] {
+            let fixture = model_plan(
+                "Remote operation",
+                "ready",
+                "",
+                serde_json::json!([{"action":action,"value":name,"paths":[],"sha":"","url":url}]),
+            );
+            let output = workspace.run(&fixture, &["--json", request]);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(json["commands"][0]["args"], args);
+            assert_eq!(json["changes_repository"], mutates);
+            workspace.assert_only_inspected();
+            workspace.assert_unchanged();
+        }
+        let wrong_unsupported = model_plan(
+            "Unsupported URL",
+            "unsupported",
+            "This URL is unsupported.",
+            serde_json::json!([]),
+        );
+        let output = workspace.run(
+            &wrong_unsupported,
+            &[
+                "--json",
+                "set remote origin URL to https://example.com/new.git",
+            ],
+        );
+        assert!(output.status.success());
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "ready");
+        assert_eq!(
+            json["commands"][0]["args"],
+            serde_json::json!(["remote", "set-url", "origin", "https://example.com/new.git"])
+        );
+        workspace.assert_only_inspected();
+        workspace.assert_unchanged();
+        let missing = model_plan(
+            "Add remote",
+            "ready",
+            "",
+            serde_json::json!([{"action":"addRemote","value":"upstream","paths":[],"url":""}]),
+        );
+        let output = workspace.run(&missing, &["--json", "I want to add new remote"]);
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "needsClarification");
+        assert_eq!(json["commands"], serde_json::json!([]));
+        let output = Command::new("git")
+            .args(["remote", "add", "origin", "https://example.com/old.git"])
+            .current_dir(&workspace.repo)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let duplicate = model_plan(
+            "Add origin",
+            "ready",
+            "",
+            serde_json::json!([{"action":"addRemote","value":"origin","paths":[],"url":"https://example.com/new.git"}]),
+        );
+        let output = workspace.run(
+            &duplicate,
+            &["--json", "add remote origin https://example.com/new.git"],
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["outcome"], "needsClarification");
+        assert!(json["clarification"].as_str().unwrap().contains("set-url"));
+        assert_eq!(json["commands"], serde_json::json!([]));
+        workspace.assert_only_inspected();
+        let unsupported = model_plan(
+            "Remove origin",
+            "unsupported",
+            "Removing remotes is not supported.",
+            serde_json::json!([]),
+        );
+        let output = workspace.run(&unsupported, &["remove remote origin"]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("Removing remotes is not supported."));
+        assert!(text.contains("Manual command: git remote remove <name>"));
+        assert!(text.ends_with(
+            "Want this supported? Open an issue at github.com/arrxy/githelper/issues\n"
+        ));
         workspace.assert_only_inspected();
         workspace.assert_unchanged();
     }
